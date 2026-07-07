@@ -10,7 +10,6 @@ ENV = args.get("ENV", "dev").lower()
 ARREARS_TABLE = args.get("ARREARS_TABLE", "cas_arrears")
 ARREARS_JOIN_KEY = args.get("ARREARS_JOIN_KEY", "account_number")
 
-
 ----
 # PATHS
 
