@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::LanguageExtensions
+Description: Sentiment Analysis + Comprehend Inference/Training Pipeline Infrastructure Stack
+
+# ---------------------------------------------------------------------------
+# Transform note: AWS::LanguageExtensions enables Fn::ForEach, which we use
+# further down to generate the 23 near-identical Lambda::Function resources
+# from a single templated block instead of 23 hand-copied ones. This is a
+# CloudFormation-native macro (no custom resources / external tooling
+# required) and is safe to add even though this template doesn't use it
+# until the Lambda section.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+
+  Stage:
+    Type: String
+    Default: nonprod
+
+  ArtifactBucket:
+    Type: String
+    Description: "S3 bucket where CI/CD uploads Lambda zips, Glue scripts, and Step Function definitions"
+    Default: psegli-datalakenonprodli-datalake-build-dev
+
+  ArtifactPrefix:
+    Type: String
+    Description: "Prefix under ArtifactBucket where sentiment analysis artifacts are uploaded"
+    Default: sentiment_analysis-artifact
+
+  CodeVersion:
+    Type: String
+    Description: "Short git SHA used to version artifact filenames, matches CI/CD CODEVERSION"
+
+  TempBucketName:
+    Type: String
+    Description: "Existing S3 bucket used for Comprehend raw data, training data, run artifacts"
+    Default: psegli-datalakenonprodli-datalake-temp-dev
+
+  CuratedBucketName:
+    Type: String
+    Description: "Existing S3 bucket holding curated survey/final data that feeds the inference pipeline"
+    Default: psegli-datalakenonprodli-datalake-curated-dev
+
+  ComprehendTrainingBucketName:
+    Type: String
+    Description: "Existing S3 bucket dedicated to Comprehend custom classifier training data/artifacts"
+    Default: psegli-datalakenonprod-comprehend-training
+
+  LambdaExecutionRoleName:
+    Type: String
+    Description: "Existing IAM role name for all Lambda functions in this stack (training + inference)"
+    Default: lambda-execution-datalake-dev
+
+  GlueServiceRoleName:
+    Type: String
+    Description: "Existing IAM role name for the three Glue jobs"
+    Default: AWSGlueServiceRole-datalake-dev
+
+  StepFunctionExecutionRoleName:
+    Type: String
+    Description: "Existing IAM role name assumed by all three state machines"
+    Default: stepfunction-execution-datalake-dev
+
+  ComprehendDataAccessRoleArn:
+    Type: String
+    Description: "ARN of the IAM role Comprehend assumes for S3 access during training/inference (trust policy allows comprehend.amazonaws.com). Confirmed from the pipeline's own GeneratePipelineConfig state."
+    Default: arn:aws:iam::053234861925:role/service-role/AmazonComprehendServiceRole-DataLakeNonProd
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: "Optional email address to subscribe to SNS alerts"
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # Glue Jobs
+  # ---------------------------------------------------------------------
+  # datalake-sentiment-analysis-curation-dev: standalone/ad-hoc, no trigger
+  # wired yet (per your confirmation - manually run today, will be added
+  # to a step function later). Job parameters confirmed via console
+  # screenshot 7/7/2026.
+  SentimentAnalysisCurationGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub datalake-sentiment-analysis-curation-${Env}
+      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${ArtifactBucket}/${ArtifactPrefix}/datalake-sentiment-analysis-curation_${CodeVersion}_${Env}.py
+        PythonVersion: 3
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      DefaultArguments:
+        '--ENV': !Ref Env
+        '--conf': 'spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true'
+        '--mode': manual
+        '--TempDir': !Sub s3://${ArtifactBucket}/datalake-${Env}-Glue_Temp/
+
+  # datalake-sentiment-analysis-dev: invoked by SurveyMonitorStepFunction
+  # (StartSentimentGlueJob state). Same --conf value as the other two Glue
+  # jobs; no --ENV/--mode parameters and no Tags (confirmed - only
+  # ComprehendGlueJob below carries the use-case tag).
+  SentimentAnalysisGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub datalake-sentiment-analysis-${Env}
+      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${ArtifactBucket}/${ArtifactPrefix}/datalake-sentiment-analysis_${CodeVersion}_${Env}.py
+        PythonVersion: 3
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      DefaultArguments:
+        '--conf': 'spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true'
+        '--TempDir': !Sub s3://${ArtifactBucket}/datalake-${Env}-Glue_Temp/
+
+  # datalake-comprehend-glue-dev: invoked by ComprehendPipelineStepFunction
+  # (LoadRawCustomerSat state) - loads raw customer sat data into the
+  # inference pipeline's working S3 prefix.
+  ComprehendGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub datalake-comprehend-glue-${Env}
+      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${ArtifactBucket}/${ArtifactPrefix}/datalake-comprehend-glue_${CodeVersion}_${Env}.py
+        PythonVersion: 3
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      DefaultArguments:
+        '--conf': 'spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true'
+        '--TempDir': !Sub s3://${ArtifactBucket}/datalake-${Env}-Glue_Temp/
+      Tags:
+        use-case: sentiment-analysis
+
+  # ---------------------------------------------------------------------
+  # Alerting - one shared topic, referenced by all three state machines'
+  # failure paths. Matches the pattern already in use in the survey-monitor
+  # and pipeline-temp JSON (both point at a "sentiment-analysis-alerts"
+  # topic name), kept separate from the CCaaS pipeline's own alerts topic
+  # per earlier confirmation.
+  # ---------------------------------------------------------------------
+  SentimentAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub datalake-sentiment-analysis-alerts-${Env}
+
+  SentimentAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref SentimentAlertsTopic
+
+Outputs:
+  SentimentAlertsTopicArn:
+    Value: !Ref SentimentAlertsTopic
