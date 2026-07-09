@@ -1,0 +1,128 @@
+{
+  "Comment": "Sentiment + Comprehend Pipeline",
+  "StartAt": "StartSentimentGlueJob",
+  "States": {
+    "StartSentimentGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "datalake-sentiment-analysis-dev",
+        "Arguments": {
+          "--mode": "auto"
+        }
+      },
+      "Next": "CheckSentimentStatus"
+    },
+    "CheckSentimentStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "StartComprehendJob_SMSRelational"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "StartComprehendJob_SMSRelational": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": false,
+          "source": "sms_web_relational",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Next": "CheckComprehendStatus_SMSRelational"
+    },
+    "CheckComprehendStatus_SMSRelational": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "StartComprehendJob_SMSTransactional"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "StartComprehendJob_SMSTransactional": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": false,
+          "source": "sms_web_transactional",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Next": "CheckComprehendStatus_SMSTransactional"
+    },
+    "CheckComprehendStatus_SMSTransactional": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "StartComprehendJob_IVR"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "StartComprehendJob_IVR": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": true,
+          "source": "ivr",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Next": "CheckComprehendStatus_IVR"
+    },
+    "CheckComprehendStatus_IVR": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "Success"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:053234861925:datalake-sentiment-analysis-alerts-dev",
+        "Message": "A Glue job in the sentiment/comprehend pipeline FAILED in dev.",
+        "Subject": "ALERT: Sentiment/Comprehend Pipeline Failure"
+      },
+      "End": true
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}
