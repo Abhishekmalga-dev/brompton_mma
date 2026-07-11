@@ -1,5 +1,6 @@
 import sys
 import boto3, json
+from datetime import date
 from typing import List
 
 from pyspark.sql.functions import broadcast, trim, lower
@@ -39,6 +40,7 @@ job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
 s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
 
 # PATHS
 
@@ -58,6 +60,7 @@ def build_prefix(*parts) -> str:
 
 CURATED_BUCKET = f"psegli-datalake{ACCOUNT_TIER}li-datalake-curated-{ENV}"
 TEMP_BUCKET = f"psegli-datalake{ACCOUNT_TIER}li-datalake-temp-{ENV}"
+AVAILABILITY_TABLE = f"psegli-datalake{ACCOUNT_TIER}li-sentiment-source-availability-{ENV}"
 
 EVENT_DATE_PATH = build_path(TEMP_BUCKET, STAGING_SEGMENT, "ccaas/event_dates/survey_api_json")
 
@@ -137,10 +140,12 @@ def batch_level_dedup(df, dedupe_keys: List[str], ts_cols: List[str]):
     w = Window.partitionBy(*dedupe_keys).orderBy(col(ts_col).desc_nulls_last())
     return df.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
 
-def dedupe_txn_rel_specific(df, label: str):
+def dedupe_txn_rel_specific(df, label: str, comment_cols: List[str]):
     """
     TXN/REL specific dedup logic based on response_received_date, cas_account_number,
-    and comment (coalesced from q4_comment_in_survey_language_sms / q4_comment_sms).
+    and comment (coalesced from the survey-specific comment_cols, e.g.
+    q4_comment_in_survey_language_sms / q4_comment_sms for TXN, or
+    q5_comment_in_survey_language_sms / q5_comment_sms for REL).
 
     Case 1: response_received_date + cas_account_number + comment all match -> duplicate.
     Case 2: comment is null, response_received_date + cas_account_number match -> duplicate.
@@ -155,7 +160,7 @@ def dedupe_txn_rel_specific(df, label: str):
     """
     total_before = df.count()
 
-    comment_source_cols = [c for c in ["q4_comment_in_survey_language_sms", "q4_comment_sms"] if c in df.columns]
+    comment_source_cols = [c for c in comment_cols if c in df.columns]
     if comment_source_cols:
         comment_expr = F.coalesce(*[F.col(c) for c in comment_source_cols])
     else:
@@ -196,8 +201,7 @@ def dedupe_txn_rel_specific(df, label: str):
     total_after = final_df.count()
 
     # VALIDATION REPORT
-    sample_cols = [c for c in ["response_received_date", "cas_account_number",
-                                "q4_comment_in_survey_language_sms", "q4_comment_sms"] if c in df.columns]
+    sample_cols = [c for c in ["response_received_date", "cas_account_number"] + comment_cols if c in df.columns]
 
     print("#" * 60)
     print(f"{label} DEDUP VALIDATION REPORT")
@@ -339,6 +343,12 @@ for event_date_value in dates_to_process:
     )
     if ivr_raw is not None:
         print(f"[INPUT COUNT] IVR records received: {ivr_raw.count()}")
+        ivr_verbatim_cols = [c for c in ["q5_overall_exp_comment_in_survey_language", "q5_overall_exp_comment"] if c in ivr_raw.columns]
+        if ivr_verbatim_cols:
+            ivr_verbatim_count = ivr_raw.filter(F.coalesce(*[F.col(c) for c in ivr_verbatim_cols]).isNotNull()).count()
+        else:
+            ivr_verbatim_count = 0
+        print(f"[INPUT COUNT] IVR records WITH verbatim: {ivr_verbatim_count}")
     else:
         print(f"[INPUT COUNT] IVR: No data found / skipped")
 
@@ -409,9 +419,15 @@ for event_date_value in dates_to_process:
     if ivr_final is not None:
         ivr_final = batch_level_dedup(ivr_final, dedupe_keys, ts_cols)
     if txn_final is not None:
-        txn_final = dedupe_txn_rel_specific(txn_final, "TXN")
+        txn_final = dedupe_txn_rel_specific(
+            txn_final, "TXN",
+            comment_cols=["q4_comment_in_survey_language_sms", "q4_comment_sms"]
+        )
     if rel_final is not None:
-        rel_final = dedupe_txn_rel_specific(rel_final, "REL")
+        rel_final = dedupe_txn_rel_specific(
+            rel_final, "REL",
+            comment_cols=["q5_comment_in_survey_language_sms", "q5_comment_sms"]
+        )
 
     print(f"IVR final count after dedupe: {ivr_final.count() if ivr_final is not None else 'N/A'}")
     print(f"TXN final count after dedupe: {txn_final.count() if txn_final is not None else 'N/A'}")
@@ -440,6 +456,7 @@ for event_date_value in dates_to_process:
             except Exception:
                 pass
             print("IVR final written successfully")
+            print(f"[FINAL WRITTEN COUNT] IVR final written output: {ivr_final.count()}")
 
         if txn_final is not None:
             #write to staging
@@ -611,6 +628,35 @@ for event_date_value in dates_to_process:
     print(f"[FINAL SUMMARY] TXN - Input: {txn_in} | Final: {txn_out}")
     print(f"[FINAL SUMMARY] REL - Input: {rel_in} | Final: {rel_out}")
     print("=" * 60)
+
+# SOURCE AVAILABILITY (for downstream Step Function)
+# One record per job execution (execution_date = today), reflecting the
+# post-dedup dataframes from the last event_date processed in the loop above.
+
+def source_has_data(df):
+    return df is not None and df.count() > 0
+
+execution_date = date.today().isoformat()
+
+ivr_available = source_has_data(ivr_final)
+txn_available = source_has_data(txn_final)
+rel_available = source_has_data(rel_final)
+
+try:
+    print(f"[AVAILABILITY] Writing source availability record for execution_date={execution_date}")
+    table = dynamodb.Table(AVAILABILITY_TABLE)
+    table.put_item(
+        Item={
+            "execution_date": execution_date,
+            "ivr_available": ivr_available,
+            "sms_web_relational_available": rel_available,
+            "sms_web_transactional_available": txn_available,
+        }
+    )
+    print(f"[AVAILABILITY] IVR={ivr_available} | TXN={txn_available} | REL={rel_available}")
+except Exception as e:
+    logger.error(f"Failed to write source availability record to DynamoDB table {AVAILABILITY_TABLE}. Error: {str(e)}")
+    raise
 
 print("Job completed successfully")
 job.commit()
