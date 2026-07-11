@@ -201,7 +201,7 @@
               "Type": "Task",
               "Resource": "arn:aws:states:::glue:startJobRun.sync",
               "Parameters": {
-                "JobName": "datalake-sentiment-analysis-curation",
+                "JobName": "datalake-sentiment-analysis-curation-dev",
                 "Arguments": {
                   "--mode": "auto"
                 }
