@@ -1,236 +1,16 @@
 {
-  "Comment": "Sentiment + Comprehend Pipeline running in parallel with Curation job, with unified failure notification",
-  "StartAt": "RunGlueJobsInParallel",
+  "Comment": "Sentiment Glue Job -> Curation Glue Job -> Comprehend Pipeline (sequential), with unified failure notification",
+  "StartAt": "StartSentimentGlueJob",
   "States": {
-    "RunGlueJobsInParallel": {
-      "Type": "Parallel",
-      "Branches": [
-        {
-          "StartAt": "StartSentimentGlueJob",
-          "States": {
-            "StartSentimentGlueJob": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::glue:startJobRun.sync",
-              "Parameters": {
-                "JobName": "datalake-sentiment-analysis-dev",
-                "Arguments": {
-                  "--mode": "auto"
-                }
-              },
-              "Next": "CheckSentimentStatus"
-            },
-            "CheckSentimentStatus": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.JobRunState",
-                  "StringEquals": "SUCCEEDED",
-                  "Next": "GetSourceAvailability"
-                }
-              ],
-              "Default": "FailBranch_Sentiment"
-            },
-            "GetSourceAvailability": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::aws-sdk:dynamodb:getItem",
-              "Parameters": {
-                "TableName": "psegli-datalakenonprodli-sentiment-source-availability-dev",
-                "Key": {
-                  "execution_date": {
-                    "S.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
-                  }
-                }
-              },
-              "ResultPath": "$.availability_result",
-              "Next": "CheckSMSRelationalAvailability"
-            },
-            "CheckSMSRelationalAvailability": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.availability_result.Item.sms_web_relational_available.BOOL",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.availability_result.Item.sms_web_relational_available.BOOL",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "StartComprehendJob_SMSRelational"
-                }
-              ],
-              "Default": "CheckSMSTransactionalAvailability"
-            },
-            "StartComprehendJob_SMSRelational": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::states:startExecution.sync:2",
-              "Parameters": {
-                "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
-                "Input": {
-                  "load_mode": "APPEND_MISSING",
-                  "dates": [],
-                  "update_rds": true,
-                  "create_endpoints": true,
-                  "delete_endpoints": false,
-                  "source": "sms_web_relational",
-                  "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
-                }
-              },
-              "ResultPath": "$.comprehend_pipeline_result",
-              "Next": "CheckComprehendStatus_SMSRelational"
-            },
-            "CheckComprehendStatus_SMSRelational": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.comprehend_pipeline_result.Status",
-                  "StringEquals": "SUCCEEDED",
-                  "Next": "CheckSMSTransactionalAvailability"
-                }
-              ],
-              "Default": "FailBranch_SMSRelational"
-            },
-            "CheckSMSTransactionalAvailability": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.availability_result.Item.sms_web_transactional_available.BOOL",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.availability_result.Item.sms_web_transactional_available.BOOL",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "StartComprehendJob_SMSTransactional"
-                }
-              ],
-              "Default": "StartComprehendJob_IVR"
-            },
-            "StartComprehendJob_SMSTransactional": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::states:startExecution.sync:2",
-              "Parameters": {
-                "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
-                "Input": {
-                  "load_mode": "APPEND_MISSING",
-                  "dates": [],
-                  "update_rds": true,
-                  "create_endpoints": true,
-                  "delete_endpoints": false,
-                  "source": "sms_web_transactional",
-                  "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
-                }
-              },
-              "ResultPath": "$.comprehend_pipeline_result",
-              "Next": "CheckComprehendStatus_SMSTransactional"
-            },
-            "CheckComprehendStatus_SMSTransactional": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.comprehend_pipeline_result.Status",
-                  "StringEquals": "SUCCEEDED",
-                  "Next": "StartComprehendJob_IVR"
-                }
-              ],
-              "Default": "FailBranch_SMSTransactional"
-            },
-            "StartComprehendJob_IVR": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::states:startExecution.sync:2",
-              "Parameters": {
-                "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
-                "Input": {
-                  "load_mode": "APPEND_MISSING",
-                  "dates": [],
-                  "update_rds": true,
-                  "create_endpoints": true,
-                  "delete_endpoints": true,
-                  "source": "ivr",
-                  "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
-                }
-              },
-              "ResultPath": "$.comprehend_pipeline_result",
-              "Next": "CheckComprehendStatus_IVR"
-            },
-            "CheckComprehendStatus_IVR": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.comprehend_pipeline_result.Status",
-                  "StringEquals": "SUCCEEDED",
-                  "Next": "SentimentBranchSuccess"
-                }
-              ],
-              "Default": "FailBranch_IVR"
-            },
-            "SentimentBranchSuccess": {
-              "Type": "Succeed"
-            },
-            "FailBranch_Sentiment": {
-              "Type": "Fail",
-              "Error": "SentimentGlueJobFailed",
-              "Cause": "datalake-sentiment-analysis-dev Glue job did not return SUCCEEDED"
-            },
-            "FailBranch_SMSRelational": {
-              "Type": "Fail",
-              "Error": "ComprehendPipelineFailed_SMSRelational",
-              "Cause": "Nested Comprehend pipeline execution for sms_web_relational did not return SUCCEEDED"
-            },
-            "FailBranch_SMSTransactional": {
-              "Type": "Fail",
-              "Error": "ComprehendPipelineFailed_SMSTransactional",
-              "Cause": "Nested Comprehend pipeline execution for sms_web_transactional did not return SUCCEEDED"
-            },
-            "FailBranch_IVR": {
-              "Type": "Fail",
-              "Error": "ComprehendPipelineFailed_IVR",
-              "Cause": "Nested Comprehend pipeline execution for ivr did not return SUCCEEDED"
-            }
-          }
-        },
-        {
-          "StartAt": "StartCurationGlueJob",
-          "States": {
-            "StartCurationGlueJob": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::glue:startJobRun.sync",
-              "Parameters": {
-                "JobName": "datalake-sentiment-analysis-curation-dev",
-                "Arguments": {
-                  "--mode": "auto"
-                }
-              },
-              "Next": "CheckCurationStatus"
-            },
-            "CheckCurationStatus": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.JobRunState",
-                  "StringEquals": "SUCCEEDED",
-                  "Next": "CurationBranchSuccess"
-                }
-              ],
-              "Default": "FailBranch_Curation"
-            },
-            "CurationBranchSuccess": {
-              "Type": "Succeed"
-            },
-            "FailBranch_Curation": {
-              "Type": "Fail",
-              "Error": "CurationGlueJobFailed",
-              "Cause": "datalake-sentiment-analysis-curation Glue job did not return SUCCEEDED"
-            }
-          }
+    "StartSentimentGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "datalake-sentiment-analysis-dev",
+        "Arguments": {
+          "--mode": "auto"
         }
-      ],
-      "ResultPath": "$.parallel_result",
+      },
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -238,22 +18,229 @@
           "Next": "NotifyFailure"
         }
       ],
-      "Next": "Success"
+      "Next": "CheckSentimentStatus"
+    },
+    "CheckSentimentStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "StartCurationGlueJob"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "StartCurationGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "datalake-sentiment-analysis-curation-dev",
+        "Arguments": {
+          "--mode": "auto"
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckCurationStatus"
+    },
+    "CheckCurationStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "GetSourceAvailability"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "GetSourceAvailability": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:getItem",
+      "Parameters": {
+        "TableName": "psegli-datalakenonprodli-sentiment-source-availability-dev",
+        "Key": {
+          "execution_date": {
+            "S.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
+          }
+        }
+      },
+      "ResultPath": "$.availability_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckSMSRelationalAvailability"
+    },
+    "CheckSMSRelationalAvailability": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.availability_result.Item.sms_web_relational_available.BOOL",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.availability_result.Item.sms_web_relational_available.BOOL",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "StartComprehendJob_SMSRelational"
+        }
+      ],
+      "Default": "CheckSMSTransactionalAvailability"
+    },
+    "StartComprehendJob_SMSRelational": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": false,
+          "source": "sms_web_relational",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckComprehendStatus_SMSRelational"
+    },
+    "CheckComprehendStatus_SMSRelational": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "CheckSMSTransactionalAvailability"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "CheckSMSTransactionalAvailability": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.availability_result.Item.sms_web_transactional_available.BOOL",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.availability_result.Item.sms_web_transactional_available.BOOL",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "StartComprehendJob_SMSTransactional"
+        }
+      ],
+      "Default": "StartComprehendJob_IVR"
+    },
+    "StartComprehendJob_SMSTransactional": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": false,
+          "source": "sms_web_transactional",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckComprehendStatus_SMSTransactional"
+    },
+    "CheckComprehendStatus_SMSTransactional": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "StartComprehendJob_IVR"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "StartComprehendJob_IVR": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": true,
+          "source": "ivr",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckComprehendStatus_IVR"
+    },
+    "CheckComprehendStatus_IVR": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "Success"
+        }
+      ],
+      "Default": "NotifyFailure"
     },
     "NotifyFailure": {
       "Type": "Task",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:053234861925:datalake-sentiment-analysis-alerts-dev",
-        "Subject": "ALERT: Sentiment/Comprehend/Curation Pipeline Failure",
-        "Message.$": "States.Format('A step in the sentiment/comprehend/curation pipeline FAILED in dev. Error: {} Cause: {}', $.error.Error, $.error.Cause)"
+        "Subject": "ALERT: Sentiment/Curation/Comprehend Pipeline Failure",
+        "Message": "A step in the sentiment/curation/comprehend pipeline FAILED in dev. Check the Step Functions execution history for details."
       },
       "Next": "Fail"
     },
     "Fail": {
       "Type": "Fail",
       "Error": "PipelineExecutionFailed",
-      "Cause": "One or more branches of the sentiment/comprehend/curation pipeline failed. See NotifyFailure SNS alert and execution history for details."
+      "Cause": "One or more steps in the sentiment/curation/comprehend pipeline failed. See NotifyFailure SNS alert and execution history for details."
     },
     "Success": {
       "Type": "Succeed"
