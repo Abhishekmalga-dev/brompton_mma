@@ -1,6 +1,7 @@
 import sys
 import boto3, json
 from typing import List
+from datetime import date
 
 from pyspark.sql.functions import broadcast, trim, lower
 from awsglue.context import GlueContext
@@ -16,7 +17,7 @@ from pyspark.sql.types import DoubleType, DateType
 
 required_args = ["JOB_NAME"]
 optional_args = []
-for opt in ["mode", "ENV", "ARREARS_JOIN_KEY", "CAS_JOIN_KEY"]:
+for opt in ["mode", "ENV", "ARREARS_JOIN_KEY", "CAS_JOIN_KEY", "STAGING"]:
     if f"--{opt}" in sys.argv:
         optional_args.append(opt)
 
@@ -36,28 +37,60 @@ job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
 s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+DDB_TRACKER_TABLE_NAME = f"datalake-sentiment-analysis-tracker-{ENV}"
+tracker_table = dynamodb.Table(DDB_TRACKER_TABLE_NAME)
 
 # PATHS
 ACCOUNT_TIER = "nonprod" if ENV == "dev" else "prod"
 TEMP_BUCKET = f"psegli-datalake{ACCOUNT_TIER}li-datalake-temp-{ENV}"
 CURATED_BUCKET = f"psegli-datalake{ACCOUNT_TIER}li-datalake-curated-{ENV}"
+
+# STAGING controls an optional path segment inserted into every S3 path below,
+# so this same job can write to a parallel "staging" area for testing without
+# touching real dev output. "dev" -> no segment (empty string). Any other
+# value (e.g. "staging") is used as-is as the segment name.
+STAGING_PARAM = args.get("STAGING", "dev").lower()
+STAGING_SEGMENT = "" if STAGING_PARAM == "dev" else STAGING_PARAM
+print(f"STAGING parameter received: '{STAGING_PARAM}' -> path segment: '{STAGING_SEGMENT or '(none)'}'")
+
+def build_path(bucket: str, *parts) -> str:
+    """
+    Builds an s3:// path from a bucket and any number of path segments,
+    silently skipping empty segments (like an empty STAGING_SEGMENT) so we
+    never end up with a double slash. Always returns a trailing slash.
+    e.g. build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/ivr")
+    -> "s3://bucket/sentiment_analysis/final/ivr/"           (STAGING_SEGMENT="")
+    -> "s3://bucket/staging/sentiment_analysis/final/ivr/"   (STAGING_SEGMENT="staging")
+    """
+    clean_parts = [p.strip("/") for p in parts if p]
+    return f"s3://{bucket}/" + "/".join(clean_parts) + "/"
+
+def build_prefix(*parts) -> str:
+    """Same segment-skipping logic as build_path, but for a bare S3 prefix
+    (no bucket, no s3:// scheme) — used where bucket and prefix are passed
+    separately, e.g. get_latest_partition_value(bucket, prefix, ...)."""
+    clean_parts = [p.strip("/") for p in parts if p]
+    return "/".join(clean_parts) + "/"
+
 CAS_BUCKET = CURATED_BUCKET
-CAS_PREFIX = "cas/"
-ARREARS_S3_PATH = f"s3://{CURATED_BUCKET}/cas_arrears/"
+CAS_PREFIX = build_prefix(STAGING_SEGMENT, "cas")
 
-EVENT_DATE_PATH = f"s3://{TEMP_BUCKET}/ccaas/event_dates/survey_api_json/"
+ARREARS_S3_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "cas_arrears")
 
-FINAL_IVR_PATH = f"s3://{CURATED_BUCKET}/sentiment_analysis/final/ivr/"
-FINAL_TXN_PATH = f"s3://{CURATED_BUCKET}/sentiment_analysis/final/transactional/"
-FINAL_REL_PATH = f"s3://{CURATED_BUCKET}/sentiment_analysis/final/relational/"
+EVENT_DATE_PATH = build_path(TEMP_BUCKET, STAGING_SEGMENT, "ccaas/event_dates/survey_api_json")
 
-CAS_JOIN_IVR_STAGING = f"s3://{CURATED_BUCKET}/sentiment_analysis/cas_join/staging/ivr/"
-CAS_JOIN_TXN_STAGING = f"s3://{CURATED_BUCKET}/sentiment_analysis/cas_join/staging/txn/"
-CAS_JOIN_REL_STAGING = f"s3://{CURATED_BUCKET}/sentiment_analysis/cas_join/staging/rel/"
+FINAL_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/ivr")
+FINAL_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/transactional")
+FINAL_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/relational")
 
-CAS_JOIN_IVR_PATH = f"s3://{CURATED_BUCKET}/sentiment_analysis/cas_join/ivr/"
-CAS_JOIN_TXN_PATH = f"s3://{CURATED_BUCKET}/sentiment_analysis/cas_join/transactional/"
-CAS_JOIN_REL_PATH = f"s3://{CURATED_BUCKET}/sentiment_analysis/cas_join/relational/"
+CAS_JOIN_IVR_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/cas_join/staging/ivr")
+CAS_JOIN_TXN_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/cas_join/staging/txn")
+CAS_JOIN_REL_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/cas_join/staging/rel")
+
+CAS_JOIN_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/cas_join/ivr")
+CAS_JOIN_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/cas_join/transactional")
+CAS_JOIN_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/cas_join/relational")
 
 # HELPERS
 
@@ -226,6 +259,10 @@ except Exception as e:
     cas_df = None
     cas_join_key = None
 
+ivr_available = False
+txn_available = False
+rel_available = False
+
 #For Loop Starts Here
 for event_date_value in dates_to_process:
     separator = "=" * 60
@@ -376,12 +413,46 @@ for event_date_value in dates_to_process:
     txn_out = txn_final.count() if txn_final is not None else "N/A"
     rel_out = rel_final.count() if rel_final is not None else "N/A"
 
+    if ivr_final is not None and isinstance(ivr_out, int) and ivr_out > 0:
+        ivr_available = True
+    if txn_final is not None and isinstance(txn_out, int) and txn_out > 0:
+        txn_available = True
+    if rel_final is not None and isinstance(rel_out, int) and rel_out > 0:
+        rel_available = True
+
     print("=" * 60)
     print(f"[FINAL SUMMARY] event_date: {event_date_value}")
     print(f"[FINAL SUMMARY] IVR - CAS-join output rows: {ivr_out}")
     print(f"[FINAL SUMMARY] TXN - CAS-join output rows: {txn_out}")
     print(f"[FINAL SUMMARY] REL - CAS-join output rows: {rel_out}")
     print("=" * 60)
+
+# AVAILABILITY TRACKING - write once per job execution so the downstream
+# Step Function can check which sources had data today before deciding
+# whether to run Comprehend classification for each one.
+execution_date = date.today().isoformat()
+
+try:
+    tracker_table.put_item(
+        Item={
+            "execution_date": execution_date,
+            "ivr_available": ivr_available,
+            "sms_web_relational_available": rel_available,
+            "sms_web_transactional_available": txn_available,
+        }
+    )
+    logger.info(
+        f"[TRACKER] Successfully wrote availability record for execution_date={execution_date}: "
+        f"ivr_available={ivr_available}, "
+        f"sms_web_relational_available={rel_available}, "
+        f"sms_web_transactional_available={txn_available}"
+    )
+except Exception as e:
+    logger.error(
+        f"[TRACKER] Failed to write availability record to {DDB_TRACKER_TABLE_NAME} "
+        f"for execution_date={execution_date}. Error: {str(e)}"
+    )
+    raise
 
 print("Job completed successfully.")
 job.commit()
