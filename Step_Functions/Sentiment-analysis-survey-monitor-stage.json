@@ -62,14 +62,10 @@
     },
     "GetSourceAvailability": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:dynamodb:getItem",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "TableName": "psegli-datalakenonprodli-sentiment-source-availability-dev",
-        "Key": {
-          "execution_date": {
-            "S.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
-          }
-        }
+        "FunctionName": "datalake-sentiment-analysis-get-availability-dev",
+        "Payload": {}
       },
       "ResultPath": "$.availability_result",
       "Catch": [
@@ -87,11 +83,11 @@
         {
           "And": [
             {
-              "Variable": "$.availability_result.Item.sms_web_relational_available.BOOL",
+              "Variable": "$.availability_result.Payload.sms_web_relational_available",
               "IsPresent": true
             },
             {
-              "Variable": "$.availability_result.Item.sms_web_relational_available.BOOL",
+              "Variable": "$.availability_result.Payload.sms_web_relational_available",
               "BooleanEquals": true
             }
           ],
@@ -142,11 +138,11 @@
         {
           "And": [
             {
-              "Variable": "$.availability_result.Item.sms_web_transactional_available.BOOL",
+              "Variable": "$.availability_result.Payload.sms_web_transactional_available",
               "IsPresent": true
             },
             {
-              "Variable": "$.availability_result.Item.sms_web_transactional_available.BOOL",
+              "Variable": "$.availability_result.Payload.sms_web_transactional_available",
               "BooleanEquals": true
             }
           ],
