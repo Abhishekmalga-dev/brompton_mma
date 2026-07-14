@@ -1,6 +1,5 @@
 import sys
 import boto3, json
-from datetime import date
 from typing import List
 
 from pyspark.sql.functions import broadcast, trim, lower
@@ -40,7 +39,6 @@ job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
 s3 = boto3.client("s3")
-dynamodb = boto3.resource("dynamodb")
 
 # PATHS
 
@@ -60,7 +58,6 @@ def build_prefix(*parts) -> str:
 
 CURATED_BUCKET = f"psegli-datalake{ACCOUNT_TIER}li-datalake-curated-{ENV}"
 TEMP_BUCKET = f"psegli-datalake{ACCOUNT_TIER}li-datalake-temp-{ENV}"
-AVAILABILITY_TABLE = f"psegli-datalake{ACCOUNT_TIER}li-sentiment-source-availability-{ENV}"
 
 EVENT_DATE_PATH = build_path(TEMP_BUCKET, STAGING_SEGMENT, "ccaas/event_dates/survey_api_json")
 
@@ -332,6 +329,7 @@ for event_date_value in dates_to_process:
     ivr_final = None
     txn_final = None
     rel_final = None
+    ivr_campaign_removed = 0
 
     # READ CURATED
     print("Reading available curated datasets")
@@ -349,6 +347,14 @@ for event_date_value in dates_to_process:
         else:
             ivr_verbatim_count = 0
         print(f"[INPUT COUNT] IVR records WITH verbatim: {ivr_verbatim_count}")
+
+        # CAMPAIGN FILTER: keep only "Main" campaign records
+        ivr_pre_campaign_count = ivr_raw.count()
+        if "campaign" in ivr_raw.columns:
+            ivr_raw = ivr_raw.filter(F.col("campaign") == "Main")
+        ivr_post_campaign_count = ivr_raw.count()
+        ivr_campaign_removed = ivr_pre_campaign_count - ivr_post_campaign_count
+        print(f"[CAMPAIGN FILTER] IVR records removed (non-Main campaign): {ivr_campaign_removed}")
     else:
         print(f"[INPUT COUNT] IVR: No data found / skipped")
 
@@ -625,38 +631,10 @@ for event_date_value in dates_to_process:
     print("=" * 60)
     print(f"[FINAL SUMMARY] event_date: {event_date_value}")
     print(f"[FINAL SUMMARY] IVR - Input: {ivr_in} | Final: {ivr_out}")
+    print(f"[FINAL SUMMARY] IVR - Removed by campaign filter (non-Main): {ivr_campaign_removed}")
     print(f"[FINAL SUMMARY] TXN - Input: {txn_in} | Final: {txn_out}")
     print(f"[FINAL SUMMARY] REL - Input: {rel_in} | Final: {rel_out}")
     print("=" * 60)
-
-# SOURCE AVAILABILITY (for downstream Step Function)
-# One record per job execution (execution_date = today), reflecting the
-# post-dedup dataframes from the last event_date processed in the loop above.
-
-def source_has_data(df):
-    return df is not None and df.count() > 0
-
-execution_date = date.today().isoformat()
-
-ivr_available = source_has_data(ivr_final)
-txn_available = source_has_data(txn_final)
-rel_available = source_has_data(rel_final)
-
-try:
-    print(f"[AVAILABILITY] Writing source availability record for execution_date={execution_date}")
-    table = dynamodb.Table(AVAILABILITY_TABLE)
-    table.put_item(
-        Item={
-            "execution_date": execution_date,
-            "ivr_available": ivr_available,
-            "sms_web_relational_available": rel_available,
-            "sms_web_transactional_available": txn_available,
-        }
-    )
-    print(f"[AVAILABILITY] IVR={ivr_available} | TXN={txn_available} | REL={rel_available}")
-except Exception as e:
-    logger.error(f"Failed to write source availability record to DynamoDB table {AVAILABILITY_TABLE}. Error: {str(e)}")
-    raise
 
 print("Job completed successfully")
 job.commit()
