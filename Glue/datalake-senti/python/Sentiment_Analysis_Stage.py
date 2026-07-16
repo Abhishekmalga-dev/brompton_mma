@@ -1,5 +1,6 @@
 import sys
 import boto3, json
+from datetime import date
 from typing import List
 
 from pyspark.sql.functions import broadcast, trim, lower
@@ -39,6 +40,15 @@ job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
 s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+
+# Tracker table this job now writes to directly (execution_date partition key,
+# one record per day). Previously written by the downstream curation job;
+# that write is being removed there so this job is the sole writer going
+# forward. Best-supported inference from prior naming conventions
+# ("datalake-{service}-{purpose}-{env}") — please confirm/correct if this
+# isn't the exact existing table name.
+TRACKER_TABLE_NAME = f"datalake-sentiment-analysis-tracker-{ENV}"
 
 # PATHS
 
@@ -137,6 +147,96 @@ def batch_level_dedup(df, dedupe_keys: List[str], ts_cols: List[str]):
     w = Window.partitionBy(*dedupe_keys).orderBy(col(ts_col).desc_nulls_last())
     return df.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
 
+def dedupe_txn_rel_specific(df, label: str, comment_cols: List[str]):
+    """
+    TXN/REL specific dedup logic based on response_received_date, cas_account_number,
+    and comment (coalesced from the survey-specific comment_cols, e.g.
+    q4_comment_in_survey_language_sms / q4_comment_sms for TXN, or
+    q5_comment_in_survey_language_sms / q5_comment_sms for REL).
+
+    Case 1: response_received_date + cas_account_number + comment all match -> duplicate.
+    Case 2: comment is null, response_received_date + cas_account_number match -> duplicate.
+    Case 3: cas_account_number + comment match but response_received_date differs -> duplicate
+            (cross-date duplicate for the same account/comment).
+
+    Cases 1 and 3 use the same underlying dedup key (cas_account_number + comment,
+    date-agnostic) — they are only split apart after the fact, for reporting, into
+    "same date" (Case 1) vs "different date" (Case 3) duplicates. Case 2 uses a
+    separate key since there is no comment to key off of.
+    The latest response_received_date is kept within each duplicate group.
+    """
+    total_before = df.count()
+
+    comment_source_cols = [c for c in comment_cols if c in df.columns]
+    if comment_source_cols:
+        comment_expr = F.coalesce(*[F.col(c) for c in comment_source_cols])
+    else:
+        comment_expr = F.lit(None).cast("string")
+
+    df = df.withColumn("_comment_value", comment_expr)
+
+    has_comment_df = df.filter(F.col("_comment_value").isNotNull())
+    no_comment_df = df.filter(F.col("_comment_value").isNull())
+
+    has_comment_total = has_comment_df.count()
+    no_comment_total = no_comment_df.count()
+
+    # CASE 2: comment is null -> dedupe on response_received_date + cas_account_number
+    w_case2 = Window.partitionBy("response_received_date", "cas_account_number") \
+        .orderBy(F.col("response_received_date").asc_nulls_last())
+    no_comment_ranked = no_comment_df.withColumn("_rn", row_number().over(w_case2))
+    case2_duplicates = no_comment_ranked.filter(F.col("_rn") > 1)
+    case2_dup_count = case2_duplicates.count()
+    no_comment_deduped = no_comment_ranked.filter(F.col("_rn") == 1).drop("_rn")
+
+    # CASE 1 + CASE 3: comment present -> dedupe on cas_account_number + comment (date-agnostic)
+    w_group = Window.partitionBy("cas_account_number", "_comment_value")
+    w_rank = w_group.orderBy(F.col("response_received_date").desc_nulls_last())
+    has_comment_ranked = has_comment_df \
+        .withColumn("_rn", row_number().over(w_rank)) \
+        .withColumn("_kept_date", F.first("response_received_date").over(w_rank))
+
+    case13_duplicates = has_comment_ranked.filter(F.col("_rn") > 1)
+    case1_duplicates = case13_duplicates.filter(F.col("response_received_date") == F.col("_kept_date"))
+    case3_duplicates = case13_duplicates.filter(F.col("response_received_date") != F.col("_kept_date"))
+    case1_dup_count = case1_duplicates.count()
+    case3_dup_count = case3_duplicates.count()
+
+    has_comment_deduped = has_comment_ranked.filter(F.col("_rn") == 1).drop("_rn", "_kept_date")
+
+    final_df = no_comment_deduped.unionByName(has_comment_deduped).drop("_comment_value")
+    total_after = final_df.count()
+
+    # VALIDATION REPORT
+    sample_cols = [c for c in ["response_received_date", "cas_account_number"] + comment_cols if c in df.columns]
+
+    print("#" * 60)
+    print(f"{label} DEDUP VALIDATION REPORT")
+    print("#" * 60)
+    print(f"{label} - Total Input Rows              : {total_before}")
+    print(f"{label} - Records WITH comment           : {has_comment_total}")
+    print(f"{label} - Records WITHOUT comment        : {no_comment_total}")
+    print("-" * 60)
+    print(f"{label} - Case 1 Duplicates Found        : {case1_dup_count}")
+    print(f"{label} - Case 2 Duplicates Found        : {case2_dup_count}")
+    print(f"{label} - Case 3 Duplicates Found        : {case3_dup_count}")
+    print(f"{label} - Record Count After Dedup       : {total_after}")
+    print("-" * 60)
+
+    if case1_dup_count > 0:
+        print(f"{label} - Case 1 Sample Duplicates (response_received_date, cas_account_number, comment same):")
+        case1_duplicates.select(*sample_cols).show(5, truncate=False)
+    if case2_dup_count > 0:
+        print(f"{label} - Case 2 Sample Duplicates (comment null, response_received_date + cas_account_number same):")
+        case2_duplicates.select(*sample_cols).show(5, truncate=False)
+    if case3_dup_count > 0:
+        print(f"{label} - Case 3 Sample Duplicates (cas_account_number + comment same, response_received_date differs):")
+        case3_duplicates.select(*sample_cols).show(5, truncate=False)
+
+    print("#" * 60)
+
+    return final_df
+
 def normalize_ivr(df):
     return df.withColumn("q1_csat_with_ivr", F.col("q1_csat_with_ivr_value").cast(DoubleType())) \
         .withColumn("q2_ease_with_ivr", F.col("q2_ease_with_ivr_value").cast(DoubleType())) \
@@ -176,7 +276,8 @@ def apply_intent(df, intent_map_df):
     ).drop(
         "intent_clean",
         "old_intent_clean",
-        "new_intent_clean"
+        "new_intent_clean",
+        "old_intent"
     )
 
 def ensure_event_date(df, event_date_value: str):
@@ -225,6 +326,12 @@ except Exception as e:
     raise
 
 #For Loop Starts Here
+
+# Accumulators for the tracker-table update at the end of the job: every
+# event_date processed in this run, plus per-date/per-source new-records info.
+all_dates_processed = []
+source_new_records_report = []
+
 for event_date_value in dates_to_process:
     separator = "=" * 60
     print(f"\n{separator}")
@@ -238,6 +345,10 @@ for event_date_value in dates_to_process:
     ivr_final = None
     txn_final = None
     rel_final = None
+    ivr_campaign_removed = 0
+    ivr_new_records_found = False
+    txn_new_records_found = False
+    rel_new_records_found = False
 
     # READ CURATED
     print("Reading available curated datasets")
@@ -249,6 +360,20 @@ for event_date_value in dates_to_process:
     )
     if ivr_raw is not None:
         print(f"[INPUT COUNT] IVR records received: {ivr_raw.count()}")
+        ivr_verbatim_cols = [c for c in ["q5_overall_exp_comment_in_survey_language", "q5_overall_exp_comment"] if c in ivr_raw.columns]
+        if ivr_verbatim_cols:
+            ivr_verbatim_count = ivr_raw.filter(F.coalesce(*[F.col(c) for c in ivr_verbatim_cols]).isNotNull()).count()
+        else:
+            ivr_verbatim_count = 0
+        print(f"[INPUT COUNT] IVR records WITH verbatim: {ivr_verbatim_count}")
+
+        # CAMPAIGN FILTER: keep only "Main" campaign records
+        ivr_pre_campaign_count = ivr_raw.count()
+        if "campaign" in ivr_raw.columns:
+            ivr_raw = ivr_raw.filter(F.col("campaign") == "Main")
+        ivr_post_campaign_count = ivr_raw.count()
+        ivr_campaign_removed = ivr_pre_campaign_count - ivr_post_campaign_count
+        print(f"[CAMPAIGN FILTER] IVR records removed (non-Main campaign): {ivr_campaign_removed}")
     else:
         print(f"[INPUT COUNT] IVR: No data found / skipped")
 
@@ -274,6 +399,13 @@ for event_date_value in dates_to_process:
 
     if ivr_raw is None and txn_raw is None and rel_raw is None:
         print(f"[SKIP] No data for event_date={event_date_value}. Moving to next date.")
+        all_dates_processed.append(event_date_value)
+        source_new_records_report.append({
+            "event_date": event_date_value,
+            "ivr_new_records_found": False,
+            "sms_web_transactional_new_records_found": False,
+            "sms_web_relational_new_records_found": False,
+        })
         continue
 
     # NORMALIZE + INTENT
@@ -319,9 +451,15 @@ for event_date_value in dates_to_process:
     if ivr_final is not None:
         ivr_final = batch_level_dedup(ivr_final, dedupe_keys, ts_cols)
     if txn_final is not None:
-        txn_final = batch_level_dedup(txn_final, dedupe_keys, ts_cols)
+        txn_final = dedupe_txn_rel_specific(
+            txn_final, "TXN",
+            comment_cols=["q4_comment_in_survey_language_sms", "q4_comment_sms"]
+        )
     if rel_final is not None:
-        rel_final = batch_level_dedup(rel_final, dedupe_keys, ts_cols)
+        rel_final = dedupe_txn_rel_specific(
+            rel_final, "REL",
+            comment_cols=["q5_comment_in_survey_language_sms", "q5_comment_sms"]
+        )
 
     print(f"IVR final count after dedupe: {ivr_final.count() if ivr_final is not None else 'N/A'}")
     print(f"TXN final count after dedupe: {txn_final.count() if txn_final is not None else 'N/A'}")
@@ -333,6 +471,17 @@ for event_date_value in dates_to_process:
         print("Writing FINAL tables (partitioned by event_date)")
 
         if ivr_final is not None:
+            # NEW RECORDS CHECK: compare what's already in S3 for this partition
+            # against what we're about to write, before the overwrite happens.
+            ivr_final_partition = f"{FINAL_IVR_PATH}event_date={event_date_value}/"
+            try:
+                ivr_existing_count = spark.read.parquet(ivr_final_partition.rstrip("/")).count()
+            except Exception:
+                ivr_existing_count = 0
+            ivr_new_count = ivr_final.count()
+            ivr_new_records_found = ivr_new_count > ivr_existing_count
+            print(f"[NEW RECORDS CHECK] IVR - Existing in S3 before this run: {ivr_existing_count} | To be written: {ivr_new_count} | New records found: {ivr_new_records_found}")
+
             #write to staging
             ivr_final.write.mode("overwrite").parquet(FINAL_IVR_STAGING)
             #Read back and write to final partition
@@ -350,8 +499,18 @@ for event_date_value in dates_to_process:
             except Exception:
                 pass
             print("IVR final written successfully")
+            print(f"[FINAL WRITTEN COUNT] IVR final written output: {ivr_final.count()}")
 
         if txn_final is not None:
+            txn_final_partition = f"{FINAL_TXN_PATH}event_date={event_date_value}/"
+            try:
+                txn_existing_count = spark.read.parquet(txn_final_partition.rstrip("/")).count()
+            except Exception:
+                txn_existing_count = 0
+            txn_new_count = txn_final.count()
+            txn_new_records_found = txn_new_count > txn_existing_count
+            print(f"[NEW RECORDS CHECK] TXN - Existing in S3 before this run: {txn_existing_count} | To be written: {txn_new_count} | New records found: {txn_new_records_found}")
+
             #write to staging
             txn_final.write.mode("overwrite").parquet(FINAL_TXN_STAGING)
             #Read back and write to final partition
@@ -371,6 +530,15 @@ for event_date_value in dates_to_process:
             print("TXN final written successfully")
 
         if rel_final is not None:
+            rel_final_partition = f"{FINAL_REL_PATH}event_date={event_date_value}/"
+            try:
+                rel_existing_count = spark.read.parquet(rel_final_partition.rstrip("/")).count()
+            except Exception:
+                rel_existing_count = 0
+            rel_new_count = rel_final.count()
+            rel_new_records_found = rel_new_count > rel_existing_count
+            print(f"[NEW RECORDS CHECK] REL - Existing in S3 before this run: {rel_existing_count} | To be written: {rel_new_count} | New records found: {rel_new_records_found}")
+
             #write to staging
             rel_final.write.mode("overwrite").parquet(FINAL_REL_STAGING)
             #Read back and write to final partition
@@ -518,9 +686,49 @@ for event_date_value in dates_to_process:
     print("=" * 60)
     print(f"[FINAL SUMMARY] event_date: {event_date_value}")
     print(f"[FINAL SUMMARY] IVR - Input: {ivr_in} | Final: {ivr_out}")
+    print(f"[FINAL SUMMARY] IVR - Removed by campaign filter (non-Main): {ivr_campaign_removed}")
     print(f"[FINAL SUMMARY] TXN - Input: {txn_in} | Final: {txn_out}")
     print(f"[FINAL SUMMARY] REL - Input: {rel_in} | Final: {rel_out}")
     print("=" * 60)
+
+    all_dates_processed.append(event_date_value)
+    source_new_records_report.append({
+        "event_date": event_date_value,
+        "ivr_new_records_found": ivr_new_records_found,
+        "sms_web_transactional_new_records_found": txn_new_records_found,
+        "sms_web_relational_new_records_found": rel_new_records_found,
+    })
+
+# TRACKER TABLE WRITE: this job is now the sole writer of the per-day tracker
+# record (the downstream curation job's DynamoDB write is being removed).
+# Availability flags use the same "post-dedup dataframe has >0 rows, False if
+# None" definition previously used by the curation job, based on the last
+# event_date processed in the loop above.
+execution_date_today = date.today().isoformat()
+
+ivr_available = ivr_final is not None and ivr_final.count() > 0
+txn_available = txn_final is not None and txn_final.count() > 0
+rel_available = rel_final is not None and rel_final.count() > 0
+
+try:
+    print(f"[TRACKER] Writing tracker record for execution_date={execution_date_today}")
+    tracker_table = dynamodb.Table(TRACKER_TABLE_NAME)
+    tracker_table.put_item(
+        Item={
+            "execution_date": execution_date_today,
+            "ivr_available": ivr_available,
+            "sms_web_relational_available": rel_available,
+            "sms_web_transactional_available": txn_available,
+            "dates_processed": all_dates_processed,
+            "source_new_records": source_new_records_report,
+        }
+    )
+    print(f"[TRACKER] ivr_available={ivr_available} | sms_web_relational_available={rel_available} | sms_web_transactional_available={txn_available}")
+    print(f"[TRACKER] dates_processed={all_dates_processed}")
+    print(f"[TRACKER] source_new_records={source_new_records_report}")
+except Exception as e:
+    logger.error(f"Failed to write tracker record to {TRACKER_TABLE_NAME} for execution_date={execution_date_today}. Error: {str(e)}")
+    raise
 
 print("Job completed successfully")
 job.commit()
