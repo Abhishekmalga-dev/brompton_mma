@@ -1,7 +1,6 @@
 import sys
 import boto3, json
 from typing import List
-from datetime import date
 
 from pyspark.sql.functions import broadcast, trim, lower
 from awsglue.context import GlueContext
@@ -37,9 +36,6 @@ job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
 s3 = boto3.client("s3")
-dynamodb = boto3.resource("dynamodb")
-DDB_TRACKER_TABLE_NAME = f"datalake-sentiment-analysis-tracker-{ENV}"
-tracker_table = dynamodb.Table(DDB_TRACKER_TABLE_NAME)
 
 # PATHS
 ACCOUNT_TIER = "nonprod" if ENV == "dev" else "prod"
@@ -259,10 +255,6 @@ except Exception as e:
     cas_df = None
     cas_join_key = None
 
-ivr_available = False
-txn_available = False
-rel_available = False
-
 #For Loop Starts Here
 for event_date_value in dates_to_process:
     separator = "=" * 60
@@ -413,46 +405,12 @@ for event_date_value in dates_to_process:
     txn_out = txn_final.count() if txn_final is not None else "N/A"
     rel_out = rel_final.count() if rel_final is not None else "N/A"
 
-    if ivr_final is not None and isinstance(ivr_out, int) and ivr_out > 0:
-        ivr_available = True
-    if txn_final is not None and isinstance(txn_out, int) and txn_out > 0:
-        txn_available = True
-    if rel_final is not None and isinstance(rel_out, int) and rel_out > 0:
-        rel_available = True
-
     print("=" * 60)
     print(f"[FINAL SUMMARY] event_date: {event_date_value}")
     print(f"[FINAL SUMMARY] IVR - CAS-join output rows: {ivr_out}")
     print(f"[FINAL SUMMARY] TXN - CAS-join output rows: {txn_out}")
     print(f"[FINAL SUMMARY] REL - CAS-join output rows: {rel_out}")
     print("=" * 60)
-
-# AVAILABILITY TRACKING - write once per job execution so the downstream
-# Step Function can check which sources had data today before deciding
-# whether to run Comprehend classification for each one.
-execution_date = date.today().isoformat()
-
-try:
-    tracker_table.put_item(
-        Item={
-            "execution_date": execution_date,
-            "ivr_available": ivr_available,
-            "sms_web_relational_available": rel_available,
-            "sms_web_transactional_available": txn_available,
-        }
-    )
-    logger.info(
-        f"[TRACKER] Successfully wrote availability record for execution_date={execution_date}: "
-        f"ivr_available={ivr_available}, "
-        f"sms_web_relational_available={rel_available}, "
-        f"sms_web_transactional_available={txn_available}"
-    )
-except Exception as e:
-    logger.error(
-        f"[TRACKER] Failed to write availability record to {DDB_TRACKER_TABLE_NAME} "
-        f"for execution_date={execution_date}. Error: {str(e)}"
-    )
-    raise
 
 print("Job completed successfully.")
 job.commit()
