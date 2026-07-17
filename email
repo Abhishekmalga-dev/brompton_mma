@@ -1,16 +1,16 @@
-Subject: FYI: SFTP File Delivery Failure via GoAnywhere — Survey Data Missing for 7/16 and 7/17
+Subject: Query: Changes to CSV File Structure for Files Received on July 16th and July 17th
 
 Hi Team,
 
-Just wanted to give you a heads-up regarding an ongoing issue with our SFTP file delivery.
+We are currently experiencing an issue with the CSV files received from NICE for July 16th and July 17th. When we attempt to upload these files through SFTP, the ingestion is failing. We have verified that other files uploaded to the same path are working successfully, which leads us to believe the issue may be specific to these files.
 
-The files we receive through SFTP via GoAnywhere have been failing for the past 2 days due to an issue on the GoAnywhere end. I have reached out to Nilo and we have been on a call with the GoAnywhere team. They are currently still debugging and working on a fix.
+Could you please help us clarify the following:
+1. Were any changes made to the CSV file structure, column names, or data format for the files sent on July 16th and/or July 17th?
+2. Were there any modifications made on your end to the data or fields being included in the export around these dates?
 
-As a result, the survey data files from NICE have not been received for 7/16 and 7/17. 
+This information will help us narrow down the root cause of the ingestion failure on our end.
 
-Once the issue is resolved, I will send a follow-up email with the full RCA and will reingest the missing data into both non-prod and prod environments.
-
-Will keep you all posted.
+Please let us know at your earliest convenience as this is impacting our data pipeline for those two days.
 
 Thank you,
 Abhishek
