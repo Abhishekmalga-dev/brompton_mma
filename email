@@ -1,0 +1,16 @@
+Subject: FYI: SFTP File Delivery Failure via GoAnywhere — Survey Data Missing for 7/16 and 7/17
+
+Hi Team,
+
+Just wanted to give you a heads-up regarding an ongoing issue with our SFTP file delivery.
+
+The files we receive through SFTP via GoAnywhere have been failing for the past 2 days due to an issue on the GoAnywhere end. I have reached out to Nilo and we have been on a call with the GoAnywhere team. They are currently still debugging and working on a fix.
+
+As a result, the survey data files from NICE have not been received for 7/16 and 7/17. 
+
+Once the issue is resolved, I will send a follow-up email with the full RCA and will reingest the missing data into both non-prod and prod environments.
+
+Will keep you all posted.
+
+Thank you,
+Abhishek
