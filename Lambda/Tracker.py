@@ -1,3 +1,4 @@
+import os
 import boto3
 import json
 from datetime import datetime, timezone
@@ -5,7 +6,9 @@ from datetime import datetime, timezone
 dynamodb = boto3.resource("dynamodb")
 
 def lambda_handler(event, context):
-    table_name = "datalake-sentiment-analysis-tracker-dev"
+    table_name = os.environ.get("TRACKER_TABLE_NAME")
+    if not table_name:
+        raise EnvironmentError("TRACKER_TABLE_NAME environment variable is not set")
     table = dynamodb.Table(table_name)
 
     # Compute today's date the same way the Curation Glue job does,
