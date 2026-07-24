@@ -1,0 +1,18 @@
+Subject: Assistance Needed: Network Error During File Upload from NICE — AWS Debugging Support
+
+Hi Team,
+
+I wanted to flag an ongoing network issue that we have been experiencing over the past week.
+
+We receive CSV export files daily from our vendor, NICE, and when we attempt to upload these files, we are encountering a network error. This has been happening consistently since last week and is impacting our data pipeline.
+
+At this point, the error message only indicates that it is a network error and does not provide further details on the root cause. This is making it difficult for us to debug the issue from our end, and our vendor NICE is also unable to determine the exact cause without more detailed error information.
+
+Could you please help us with the following:
+1. Is there a way to get more detailed error logs or diagnostics from AWS to help identify the exact cause of the network failure during the file upload?
+2. Could you help route us to the right point of contact at AWS Support to assist with debugging this issue?
+
+Any help in getting more clarity on this error would be greatly appreciated, as it is currently causing data gaps in our pipeline.
+
+Thank you,
+Abhishek
