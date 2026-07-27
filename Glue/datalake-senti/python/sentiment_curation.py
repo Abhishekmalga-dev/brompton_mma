@@ -16,7 +16,7 @@ from pyspark.sql.types import DoubleType, DateType
 
 required_args = ["JOB_NAME"]
 optional_args = []
-for opt in ["mode", "ENV", "ARREARS_JOIN_KEY", "CAS_JOIN_KEY", "STAGING"]:
+for opt in ["mode", "ENV", "ARREARS_JOIN_KEY", "CAS_JOIN_KEY", "CF_MA_RTM_JOIN_KEY", "STAGING"]:
     if f"--{opt}" in sys.argv:
         optional_args.append(opt)
 
@@ -25,6 +25,7 @@ processing_mode = args.get("mode", "manual").lower()
 ENV = args.get("ENV", "dev").lower()
 ARREARS_JOIN_KEY = args.get("ARREARS_JOIN_KEY", "account_number")
 CAS_JOIN_KEY = args.get("CAS_JOIN_KEY", "account_number")
+CF_MA_RTM_JOIN_KEY = args.get("CF_MA_RTM_JOIN_KEY", "account_number")
 
 sc = SparkContext.getOrCreate()
 glueContext = GlueContext(sc)
@@ -69,10 +70,13 @@ def build_prefix(*parts) -> str:
     clean_parts = [p.strip("/") for p in parts if p]
     return "/".join(clean_parts) + "/"
 
-CAS_BUCKET = CURATED_BUCKET
-CAS_PREFIX = build_prefix(STAGING_SEGMENT, "cas")
+PROD_CURATED_BUCKET = "psegli-datalakeprodli-datalake-curated-prod"
 
-ARREARS_S3_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "cas_arrears")
+CAS_BUCKET = PROD_CURATED_BUCKET
+CAS_PREFIX = "cas/"
+
+ARREARS_BUCKET = PROD_CURATED_BUCKET
+ARREARS_PREFIX = "cas_arrears/"
 
 EVENT_DATE_PATH = build_path(TEMP_BUCKET, STAGING_SEGMENT, "ccaas/event_dates/survey_api_json")
 
@@ -117,12 +121,17 @@ def enrich_with_reference(df, ref_df, ref_join_key):
     survey_join_key = None
     for candidate in ["customer_account_number", "cas_account_number"]:
         if candidate in df.columns:
-            survey_join_key = candidate
-            break
+            has_data = df.filter(col(candidate).isNotNull()).limit(1).count() > 0
+            if has_data:
+                survey_join_key = candidate
+                break
+            else:
+                print(f"[REFERENCE] Column '{candidate}' exists but is entirely null "
+                      f"in this dataset - checking next candidate.")
 
     if not survey_join_key:
         print("[REFERENCE] skipping enrichment - neither customer_account_number "
-            "nor cas_account_number present in this dataset's columns.")
+            "nor cas_account_number has any non-null values in this dataset's columns.")
 
         return df, None
 
@@ -188,35 +197,47 @@ arrears_df = None
 arrears_join_key = None
 
 try:
-    _arrears_raw = spark.read.parquet(ARREARS_S3_PATH)
+    latest_arrears_insert_date = get_latest_partition_value(ARREARS_BUCKET, ARREARS_PREFIX, "insert_date")
 
-    if ARREARS_JOIN_KEY not in _arrears_raw.columns:
-        print(f"[WARN] Expected join key '{ARREARS_JOIN_KEY} not found in "
-            f"{ARREARS_S3_PATH}. Available columns: "
-            f"{_arrears_raw.columns}. Arreras enrichment will be skipped.")
-
+    if not latest_arrears_insert_date:
+        print(f"[WARN] No insert_date partitions found under s3://{ARREARS_BUCKET}/{ARREARS_PREFIX}. "
+              f"Arrears enrichment will be skipped.")
     else:
-        arrears_join_key = ARREARS_JOIN_KEY
-        arrears_df = (
-            _arrears_raw
-            .withColumn(arrears_join_key, col(arrears_join_key).cast("string"))
-            .select(
-                col(arrears_join_key).alias(arrears_join_key),
-                col("30_day_arrears").alias("arrears_30_day"),
-                col("60_day_arrears").alias("arrears_60_day"),
-                col("90_day_arrears").alias("arrears_90_day"),
-                col("tariff_rate_code").alias("arrears_tariff_rate_code"),
-                col("current_balance").alias("arrears_current_balance"),
-            )
-        )
+        ARREARS_S3_PATH = f"s3://{ARREARS_BUCKET}/{ARREARS_PREFIX}insert_date={latest_arrears_insert_date}/"
+        print(f"[ARREARS] Reading latest partition: {ARREARS_S3_PATH}")
 
-        print(f"[ARREARS] Loaded {arrears_df.count()} rows from "
-            f"{ARREARS_S3_PATH}, join key: {arrears_join_key}")
+        _arrears_raw = spark.read.parquet(ARREARS_S3_PATH)
+
+        if ARREARS_JOIN_KEY not in _arrears_raw.columns:
+            print(f"[WARN] Expected join key '{ARREARS_JOIN_KEY}' not found in "
+                f"{ARREARS_S3_PATH}. Available columns: "
+                f"{_arrears_raw.columns}. Arrears enrichment will be skipped.")
+
+        else:
+            arrears_join_key = ARREARS_JOIN_KEY
+            arrears_df = (
+                _arrears_raw
+                .withColumn(arrears_join_key, col(arrears_join_key).cast("string"))
+                .select(
+                    col(arrears_join_key).alias(arrears_join_key),
+                    col("30_day_arrears").alias("arrears_30_day"),
+                    col("60_day_arrears").alias("arrears_60_day"),
+                    col("90_day_arrears").alias("arrears_90_day"),
+                    col("tariff_rate_code").alias("arrears_tariff_rate_code"),
+                    col("current_balance").alias("arrears_current_balance"),
+                    col("agreement_status_code").alias("arrears_agreement_status_code"),
+                    col("critical_facility_code").alias("arrears_critical_facility_code"),
+                )
+            )
+
+            print(f"[ARREARS] Loaded {arrears_df.count()} rows from "
+                f"{ARREARS_S3_PATH}, join key: {arrears_join_key}")
 
 except Exception as e:
-    print(f"[ERROR] Failed to load arrears reference data from {ARREARS_S3_PATH}: {e}")
+    print(f"[ERROR] Failed to load arrears reference data: {e}")
     arrears_df = None
     arrears_join_key = None
+
 
 cas_df = None
 cas_join_key = None
@@ -246,6 +267,10 @@ try:
                     col(cas_join_key).alias(cas_join_key),
                     col("bal_billing_code").alias("cas_bal_billing_code"),
                     col("current_credit_history_code").alias("cas_current_credit_history_code"),
+                    col("electric_rate_code").alias("cas_electric_rate_code"),
+                    col("Division").alias("cas_division"),
+                    col("zip_code").alias("cas_zip_code"),
+                    col("bi_directional_ind").alias("cas_bi_directional_ind"),
                 )
             )
             print(f"[CAS] Loaded {cas_df.count()} rows from {CAS_S3_PATH}, join key: {cas_join_key}")
@@ -254,6 +279,39 @@ except Exception as e:
     print(f"[ERROR] Failed to load CAS reference data: {e}")
     cas_df = None
     cas_join_key = None
+
+#CF_MA_RTM Reference Data - single flat file, prod curated bucket regardless
+# of ENV/STAGING (this is a shared prod reference source, not environment-specific)
+CF_MA_RTM_PATH = f"s3://{PROD_CURATED_BUCKET}/cf_ma_rtm/cf_ma_rtm_restored/"
+
+cf_ma_rtm_df = None
+cf_ma_rtm_join_key = None
+
+try:
+    _cf_ma_rtm_raw = spark.read.parquet(CF_MA_RTM_PATH)
+
+    if CF_MA_RTM_JOIN_KEY not in _cf_ma_rtm_raw.columns:
+        print(f"[WARN] Expected join key '{CF_MA_RTM_JOIN_KEY}' not found in "
+              f"{CF_MA_RTM_PATH}. Available columns: {_cf_ma_rtm_raw.columns}. "
+              f"CF_MA_RTM enrichment will be skipped.")
+    else:
+        cf_ma_rtm_join_key = CF_MA_RTM_JOIN_KEY
+        cf_ma_rtm_df = (
+            _cf_ma_rtm_raw
+            .withColumn(cf_ma_rtm_join_key, col(cf_ma_rtm_join_key).cast("string"))
+            .select(
+                col(cf_ma_rtm_join_key).alias(cf_ma_rtm_join_key),
+                col("ami_lost_power_restored_datetm").alias("cf_ma_rtm_ami_lost_power_restored_datetm"),
+                col("ami_lost_power_off_datetm").alias("cf_ma_rtm_ami_lost_power_off_datetm"),
+            )
+        )
+        print(f"[CF_MA_RTM] Loaded {cf_ma_rtm_df.count()} rows from {CF_MA_RTM_PATH}, "
+              f"join key: {cf_ma_rtm_join_key}")
+
+except Exception as e:
+    print(f"[ERROR] Failed to load CF_MA_RTM reference data: {e}")
+    cf_ma_rtm_df = None
+    cf_ma_rtm_join_key = None
 
 #For Loop Starts Here
 for event_date_value in dates_to_process:
@@ -335,6 +393,22 @@ for event_date_value in dates_to_process:
         rel_final, rel_cas_key = enrich_with_reference(rel_final, cas_df, cas_join_key)
         if rel_cas_key:
             print(f"[CAS] Enriched REL using join key '{rel_cas_key}'")
+
+    #Add CF_MA_RTM call site
+    if ivr_final is not None:
+        ivr_final, ivr_cf_ma_rtm_key = enrich_with_reference(ivr_final, cf_ma_rtm_df, cf_ma_rtm_join_key)
+        if ivr_cf_ma_rtm_key:
+            print(f"[CF_MA_RTM] Enriched IVR using join key '{ivr_cf_ma_rtm_key}'")
+
+    if txn_final is not None:
+        txn_final, txn_cf_ma_rtm_key = enrich_with_reference(txn_final, cf_ma_rtm_df, cf_ma_rtm_join_key)
+        if txn_cf_ma_rtm_key:
+            print(f"[CF_MA_RTM] Enriched TXN using join key '{txn_cf_ma_rtm_key}'")
+
+    if rel_final is not None:
+        rel_final, rel_cf_ma_rtm_key = enrich_with_reference(rel_final, cf_ma_rtm_df, cf_ma_rtm_join_key)
+        if rel_cf_ma_rtm_key:
+            print(f"[CF_MA_RTM] Enriched REL using join key '{rel_cf_ma_rtm_key}'")
 
     # WRITE CAS-JOIN OUTPUT (partitioned by event_date)
 
