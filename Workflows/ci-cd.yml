@@ -1,173 +1,191 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::LanguageExtensions
-Description: Sentiment Analysis + Comprehend Inference/Training Pipeline Infrastructure Stack
+name: Deploy Sentiment Analysis Infrastructure
 
-# ---------------------------------------------------------------------------
-# Transform note: AWS::LanguageExtensions enables Fn::ForEach, which we use
-# further down to generate the 23 near-identical Lambda::Function resources
-# from a single templated block instead of 23 hand-copied ones. This is a
-# CloudFormation-native macro (no custom resources / external tooling
-# required) and is safe to add even though this template doesn't use it
-# until the Lambda section.
-# ---------------------------------------------------------------------------
-
-Parameters:
-  Env:
-    Type: String
-    AllowedValues:
+# NOTE on triggers - flagged design decision, please confirm:
+# The old ccaas ci-cd.yml derived environment purely from git branch (main=prod,
+# else=dev), which worked when there were only two environments tied to two
+# branches. Our new template has three DeployEnv values, and "staging" is NOT a
+# separate git branch (confirmed: dev IS staging, conceptually - staging is an
+# on-demand parallel CloudFormation stack in the same nonprod account, not a
+# continuously-deployed branch). So:
+#   - push to "dev" branch  -> auto-deploy DeployEnv=dev  (unchanged behavior)
+#   - push to "main" branch -> auto-deploy DeployEnv=prod (unchanged behavior)
+#   - workflow_dispatch     -> manual trigger, lets someone deliberately deploy
+#                              to dev/staging/prod on demand from any branch -
+#                              this is the only way to reach DeployEnv=staging,
+#                              since no branch maps to it automatically.
+on:
+  push:
+    branches:
       - dev
-      - prod
-    Default: dev
+      - main
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: "Environment to deploy (overrides branch-based default - required for staging)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
 
-  Stage:
-    Type: String
-    Default: nonprod
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64, datalake]
 
-  ArtifactBucket:
-    Type: String
-    Description: "S3 bucket where CI/CD uploads Lambda zips, Glue scripts, and Step Function definitions"
-    Default: psegli-datalakenonprodli-datalake-build-dev
+    env:
+      AWS_REGION: us-east-1
 
-  ArtifactPrefix:
-    Type: String
-    Description: "Prefix under ArtifactBucket where sentiment analysis artifacts are uploaded"
-    Default: sentiment_analysis-artifact
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_env || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
 
-  CodeVersion:
-    Type: String
-    Description: "Short git SHA used to version artifact filenames, matches CI/CD CODEVERSION"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-  TempBucketName:
-    Type: String
-    Description: "Existing S3 bucket used for Comprehend raw data, training data, run artifacts"
-    Default: psegli-datalakenonprodli-datalake-temp-dev
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  CuratedBucketName:
-    Type: String
-    Description: "Existing S3 bucket holding curated survey/final data that feeds the inference pipeline"
-    Default: psegli-datalakenonprodli-datalake-curated-dev
+      - name: Set environment variables based on trigger
+        run: |
+          # workflow_dispatch (manual) takes precedence and is the ONLY path that
+          # can produce DEPLOY_ENV=staging - push events always resolve to dev/prod.
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "DEPLOY_ENV=${{ inputs.deploy_env }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "DEPLOY_ENV=prod" >> $GITHUB_ENV
+          else
+            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+          fi
 
-  ComprehendTrainingBucketName:
-    Type: String
-    Description: "Existing S3 bucket dedicated to Comprehend custom classifier training data/artifacts"
-    Default: psegli-datalakenonprod-comprehend-training
+          echo "CODEVERSION=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
 
-  LambdaExecutionRoleName:
-    Type: String
-    Description: "Existing IAM role name for all Lambda functions in this stack (training + inference)"
-    Default: lambda-execution-datalake-dev
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "GITHUB_EVENT_NAME=${{ github.event_name }}"
 
-  GlueServiceRoleName:
-    Type: String
-    Description: "Existing IAM role name for the three Glue jobs"
-    Default: AWSGlueServiceRole-datalake-dev
+      - name: Resolve script/artifact env token
+        run: |
+          # Matches the template's EnvToken logic (IsProd ? prod : dev) - dev and
+          # staging deploys SHARE the same compiled script/zip artifacts, since
+          # they're the same code on the same nonprod tier. Only the CloudFormation
+          # resource NAMES differ (via ResourceSuffix, computed inside the template
+          # itself from DeployEnv) - artifact filenames never contain "staging".
+          if [ "${DEPLOY_ENV}" == "prod" ]; then
+            echo "ARTIFACT_ENV_TOKEN=prod" >> $GITHUB_ENV
+          else
+            echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+          fi
 
-  StepFunctionExecutionRoleName:
-    Type: String
-    Description: "Existing IAM role name assumed by all three state machines"
-    Default: stepfunction-execution-datalake-dev
+      - name: Build and upload Lambda artifacts
+        run: |
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+          ARTIFACT_PREFIX="sentiment-artifact"
+          LAMBDA_BASE="source/pipeline/lambda-functions"
 
-  ComprehendDataAccessRoleArn:
-    Type: String
-    Description: "ARN of the IAM role Comprehend assumes for S3 access during training/inference (trust policy allows comprehend.amazonaws.com). Confirmed from the pipeline's own GeneratePipelineConfig state."
-    Default: arn:aws:iam::053234861925:role/service-role/AmazonComprehendServiceRole-DataLakeNonProd
+          # 13 Lambda functions - names must exactly match:
+          #   1) the folder name under lambda-functions/<name>/python/<name>.py
+          #   2) the FunctionName base used in the CloudFormation template
+          #   3) the S3Key base the template's !Sub expects
+          LAMBDAS=(
+            "datalake-comprehend-actionable"
+            "datalake-comprehend-clean-temp"
+            "datalake-comprehend-corrected-output"
+            "datalake-comprehend-create-endpoints"
+            "datalake-comprehend-delete-endpoints"
+            "datalake-comprehend-final-output"
+            "datalake-comprehend-level2"
+            "datalake-comprehend-level3"
+            "datalake-comprehend-level4"
+            "datalake-comprehend-raw-status-check"
+            "datalake-comprehend-sentiment"
+            "datalake-comprehend-urgent"
+            "datalake-sentiment-analysis-get-availability"
+          )
 
-  AlertEmail:
-    Type: String
-    Default: ''
-    Description: "Optional email address to subscribe to SNS alerts"
+          for name in "${LAMBDAS[@]}"; do
+            SRC_DIR="${LAMBDA_BASE}/${name}/python"
+            if [ -f "${SRC_DIR}/${name}.py" ]; then
+              # Zip must contain the python/ subfolder itself (not just its
+              # contents), matching the Handler convention: python.<name>.lambda_handler
+              mkdir -p "build/${name}/python"
+              cp "${SRC_DIR}/${name}.py" "build/${name}/python/"
+              (cd "build/${name}" && zip -r "../../${name}.zip" python)
+              aws s3 cp "${name}.zip" \
+                "s3://${ARTIFACT_BUCKET}/${ARTIFACT_PREFIX}/${name}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.zip" \
+                --no-verify-ssl
+            else
+              echo "WARNING: ${SRC_DIR}/${name}.py not found - skipping ${name}"
+            fi
+          done
 
-Conditions:
-  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+      - name: Upload Glue scripts
+        run: |
+          # Path CONFIRMED via screenshot: source/pipeline/glue/<script>.py
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+          ARTIFACT_PREFIX="sentiment-artifact"
+          GLUE_BASE="source/pipeline/glue"
 
-Resources:
+          mkdir -p build
 
-  # ---------------------------------------------------------------------
-  # Glue Jobs
-  # ---------------------------------------------------------------------
-  # datalake-sentiment-analysis-curation-dev: standalone/ad-hoc, no trigger
-  # wired yet (per your confirmation - manually run today, will be added
-  # to a step function later). Job parameters confirmed via console
-  # screenshot 7/7/2026.
-  SentimentAnalysisCurationGlueJob:
-    Type: AWS::Glue::Job
-    Properties:
-      Name: !Sub datalake-sentiment-analysis-curation-${Env}
-      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}
-      Command:
-        Name: glueetl
-        ScriptLocation: !Sub s3://${ArtifactBucket}/${ArtifactPrefix}/datalake-sentiment-analysis-curation_${CodeVersion}_${Env}.py
-        PythonVersion: 3
-      GlueVersion: "5.0"
-      WorkerType: G.1X
-      NumberOfWorkers: 10
-      DefaultArguments:
-        '--ENV': !Ref Env
-        '--conf': 'spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true'
-        '--mode': manual
-        '--TempDir': !Sub s3://${ArtifactBucket}/datalake-${Env}-Glue_Temp/
+          for script in datalake-sentiment-analysis datalake-sentiment-analysis-curation; do
+            SRC="${GLUE_BASE}/${script}.py"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "build/${script}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py"
+              aws s3 cp "build/${script}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py" \
+                "s3://${ARTIFACT_BUCKET}/sentiment-artifact/" --no-verify-ssl
+            else
+              echo "WARNING: ${SRC} not found - skipping ${script}"
+            fi
+          done
 
-  # datalake-sentiment-analysis-dev: invoked by SurveyMonitorStepFunction
-  # (StartSentimentGlueJob state). Same --conf value as the other two Glue
-  # jobs; no --ENV/--mode parameters and no Tags (confirmed - only
-  # ComprehendGlueJob below carries the use-case tag).
-  SentimentAnalysisGlueJob:
-    Type: AWS::Glue::Job
-    Properties:
-      Name: !Sub datalake-sentiment-analysis-${Env}
-      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}
-      Command:
-        Name: glueetl
-        ScriptLocation: !Sub s3://${ArtifactBucket}/${ArtifactPrefix}/datalake-sentiment-analysis_${CodeVersion}_${Env}.py
-        PythonVersion: 3
-      GlueVersion: "5.0"
-      WorkerType: G.1X
-      NumberOfWorkers: 10
-      DefaultArguments:
-        '--conf': 'spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true'
-        '--TempDir': !Sub s3://${ArtifactBucket}/datalake-${Env}-Glue_Temp/
+          # datalake-comprehend-glue uses its own separate, already-confirmed
+          # script location (datalake_nonprod-Glue_Scripts/) - NOT the shared
+          # sentiment-artifact prefix used by the two jobs above.
+          COMPREHEND_GLUE_SRC="${GLUE_BASE}/datalake-comprehend-glue.py"
+          if [ -f "$COMPREHEND_GLUE_SRC" ]; then
+            cp "$COMPREHEND_GLUE_SRC" "build/datalake-comprehend-glue_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py"
+            aws s3 cp "build/datalake-comprehend-glue_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py" \
+              "s3://${ARTIFACT_BUCKET}/datalake_nonprod-Glue_Scripts/" --no-verify-ssl
+          else
+            echo "WARNING: ${COMPREHEND_GLUE_SRC} not found - skipping datalake-comprehend-glue"
+          fi
 
-  # datalake-comprehend-glue-dev: invoked by ComprehendPipelineStepFunction
-  # (LoadRawCustomerSat state) - loads raw customer sat data into the
-  # inference pipeline's working S3 prefix.
-  ComprehendGlueJob:
-    Type: AWS::Glue::Job
-    Properties:
-      Name: !Sub datalake-comprehend-glue-${Env}
-      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}
-      Command:
-        Name: glueetl
-        ScriptLocation: !Sub s3://${ArtifactBucket}/${ArtifactPrefix}/datalake-comprehend-glue_${CodeVersion}_${Env}.py
-        PythonVersion: 3
-      GlueVersion: "5.0"
-      WorkerType: G.1X
-      NumberOfWorkers: 10
-      DefaultArguments:
-        '--conf': 'spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true'
-        '--TempDir': !Sub s3://${ArtifactBucket}/datalake-${Env}-Glue_Temp/
-      Tags:
-        use-case: sentiment-analysis
+      - name: Validate CloudFormation template
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/sentiment_analysis_stack.yml"
+          aws cloudformation validate-template --template-body file://"$TEMPLATE"
 
-  # ---------------------------------------------------------------------
-  # Alerting - one shared topic, referenced by all three state machines'
-  # failure paths. Matches the pattern already in use in the survey-monitor
-  # and pipeline-temp JSON (both point at a "sentiment-analysis-alerts"
-  # topic name), kept separate from the CCaaS pipeline's own alerts topic
-  # per earlier confirmation.
-  # ---------------------------------------------------------------------
-  SentimentAlertsTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub datalake-sentiment-analysis-alerts-${Env}
+      - name: Deploy CloudFormation stack
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/sentiment_analysis_stack.yml"
+          STACK_NAME="datalake-sentiment-analysis-infra-${DEPLOY_ENV}"
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
 
-  SentimentAlertsSubscription:
-    Type: AWS::SNS::Subscription
-    Condition: HasAlertEmail
-    Properties:
-      Protocol: email
-      Endpoint: !Ref AlertEmail
-      TopicArn: !Ref SentimentAlertsTopic
+          # No --capabilities flag needed: this template creates zero IAM
+          # resources (Ground Rule 1) - all roles are referenced by name only.
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+              DeployEnv=${DEPLOY_ENV} \
+              ArtifactBucket=${ARTIFACT_BUCKET} \
+              CodeVersion=${CODEVERSION}
 
-Outputs:
-  SentimentAlertsTopicArn:
-    Value: !Ref SentimentAlertsTopic
+      - name: Print CloudFormation Events on Failure
+        if: always()
+        run: |
+          aws cloudformation describe-stack-events \
+            --stack-name "datalake-sentiment-analysis-infra-${DEPLOY_ENV}" \
+            --query 'StackEvents[?ResourceStatus==`FAILED`]' \
+            --max-items 50
