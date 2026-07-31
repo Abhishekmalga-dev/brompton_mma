@@ -560,39 +560,8 @@ for event_date_value in dates_to_process:
         logger.error(f"Failed to write final parquet files. Error:{str(e)}")
         raise
 
-    # DAILY AGGREGATES
+    # YTD AGGREGATES (inside loop, one row per date per survey type)
 
-    print("Computing daily aggregates")
-    daily_date = F.lit(event_date_value).cast(DateType())
-
-    ivr_agg = None
-    txn_agg = None
-    rel_agg = None
-
-    if ivr_final is not None:
-        ivr_agg = ivr_final.filter(F.col("event_date") == daily_date).agg(
-            F.avg("q1_csat_with_ivr").alias("q1_avg_csat"),
-            F.avg("q2_ease_with_ivr").alias("q2_avg_csat"),
-            F.avg("q3_csat_with_pseg_li").alias("q3_avg_csat")
-        ).withColumn("event_date", daily_date)
-
-    if txn_final is not None:
-        txn_agg = txn_final.filter(F.col("event_date") == daily_date).agg(
-            F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
-            F.avg("q2_effort_value").alias("q2_avg_csat"),
-            F.avg("q3_overall_satisfaction").alias("q3_avg_csat")
-        ).withColumn("event_date", daily_date)
-
-    if rel_final is not None:
-        rel_agg = rel_final.filter(F.col("event_date") == daily_date).agg(
-            F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
-            F.avg("q3_effort_value").alias("q2_avg_csat"),
-            F.avg("q4_overall_satisfaction").alias("q3_avg_csat")
-        ).withColumn("event_date", daily_date)
-
-    # YTD AGGREGATES
-
-    print("Computing YTD aggregates")
     today = F.current_date()
 
     ivr_ytd = None
@@ -628,21 +597,6 @@ for event_date_value in dates_to_process:
             F.avg("q4_overall_satisfaction").alias("q3_avg_csat")
         ).withColumn("event_date", daily_date) \
          .withColumn("processing_date", today)
-
-    # WRITE AGG (one file per survey type)
-
-    try:
-        print("Writing aggregate files")
-        if ivr_agg is not None:
-            write_single_file(ivr_agg, AGG_IVR_FILE, AGG_IVR_TMP, "IVR AGG")
-        if txn_agg is not None:
-            write_single_file(txn_agg, AGG_TXN_FILE, AGG_TXN_TMP, "TXN AGG")
-        if rel_agg is not None:
-            write_single_file(rel_agg, AGG_REL_FILE, AGG_REL_TMP, "REL AGG")
-        print("Aggregate files written successfully")
-    except Exception as e:
-        logger.error(f"Failed to write AGG files. Error: {str(e)}")
-        raise
 
     # WRITE YTD (one file per survey type)
 
@@ -698,6 +652,71 @@ for event_date_value in dates_to_process:
         "sms_web_transactional_new_records_found": txn_new_records_found,
         "sms_web_relational_new_records_found": rel_new_records_found,
     })
+
+# DAILY AGGREGATES (computed once after all dates processed)
+# This is a cumulative/rolling average across ALL historical data currently
+# in the FINAL_* paths, then overwrites the daily aggregate files.
+# Schema: event_start_date (earliest event_date in the data),
+# event_end_date (latest event_date in the data), calculated_date (today,
+# i.e. when this aggregate was computed) — plus the avg score columns.
+
+print("Computing daily aggregates (cumulative across all historical data)")
+calculated_date = F.lit(date.today()).cast(DateType())
+
+ivr_agg = None
+txn_agg = None
+rel_agg = None
+
+try:
+    # Read entire FINAL_IVR_PATH (all partitions, all historical data)
+    if ivr_final is not None:
+        ivr_all_history = spark.read.parquet(FINAL_IVR_PATH.rstrip("/"))
+        ivr_agg = ivr_all_history.agg(
+            F.avg("q1_csat_with_ivr").alias("q1_avg_csat"),
+            F.avg("q2_ease_with_ivr").alias("q2_avg_csat"),
+            F.avg("q3_csat_with_pseg_li").alias("q3_avg_csat"),
+            F.min("event_date").alias("event_start_date"),
+            F.max("event_date").alias("event_end_date")
+        ).withColumn("calculated_date", calculated_date)
+        print(f"[DAILY AGG] IVR: read {ivr_all_history.count()} total records, computed cumulative average")
+
+    # Read entire FINAL_TXN_PATH (all partitions, all historical data)
+    if txn_final is not None:
+        txn_all_history = spark.read.parquet(FINAL_TXN_PATH.rstrip("/"))
+        txn_agg = txn_all_history.agg(
+            F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
+            F.avg("q2_effort_value").alias("q2_avg_csat"),
+            F.avg("q3_overall_satisfaction").alias("q3_avg_csat"),
+            F.min("event_date").alias("event_start_date"),
+            F.max("event_date").alias("event_end_date")
+        ).withColumn("calculated_date", calculated_date)
+        print(f"[DAILY AGG] TXN: read {txn_all_history.count()} total records, computed cumulative average")
+
+    # Read entire FINAL_REL_PATH (all partitions, all historical data)
+    if rel_final is not None:
+        rel_all_history = spark.read.parquet(FINAL_REL_PATH.rstrip("/"))
+        rel_agg = rel_all_history.agg(
+            F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
+            F.avg("q3_effort_value").alias("q2_avg_csat"),
+            F.avg("q4_overall_satisfaction").alias("q3_avg_csat"),
+            F.min("event_date").alias("event_start_date"),
+            F.max("event_date").alias("event_end_date")
+        ).withColumn("calculated_date", calculated_date)
+        print(f"[DAILY AGG] REL: read {rel_all_history.count()} total records, computed cumulative average")
+
+    # WRITE AGG (one file per survey type, overwrite mode)
+    print("Writing daily aggregate files (overwrite)")
+    if ivr_agg is not None:
+        write_single_file(ivr_agg, AGG_IVR_FILE, AGG_IVR_TMP, "IVR AGG")
+    if txn_agg is not None:
+        write_single_file(txn_agg, AGG_TXN_FILE, AGG_TXN_TMP, "TXN AGG")
+    if rel_agg is not None:
+        write_single_file(rel_agg, AGG_REL_FILE, AGG_REL_TMP, "REL AGG")
+    print("Daily aggregate files written successfully")
+
+except Exception as e:
+    logger.error(f"Failed to compute/write daily aggregates. Error: {str(e)}")
+    raise
 
 # TRACKER TABLE WRITE: this job is now the sole writer of the per-day tracker
 # record (the downstream curation job's DynamoDB write is being removed).
