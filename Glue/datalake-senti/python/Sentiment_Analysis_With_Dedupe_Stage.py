@@ -200,18 +200,22 @@ def write_removed_records_csv(df, final_path: str, tmp_path: str, label: str):
 
 def batch_level_dedup(df, dedupe_keys: List[str], ts_cols: List[str]):
     """
-    Returns (deduped, removed). The logic that decides which rows are KEPT is
-    unchanged from before; removed rows are simply the set-difference
-    (df.exceptAll(deduped)) so we can report/export exactly what got dropped.
+    Returns (deduped, removed), both derived from the SAME ranked DataFrame
+    via _rn filtering -- NOT via exceptAll. exceptAll between two separately
+    derived DataFrames that both trace through apply_intent()'s broadcast
+    join can trigger Spark attribute-resolution errors (Catalyst loses track
+    of which "new_intent" column, by internal expression ID, is being
+    referenced -- "Couldn't find new_intent#N in [...]"). Deriving both
+    outputs from one ranked DataFrame avoids that entirely, matching the
+    approach already used safely in dedupe_txn_rel_specific.
     """
     dedupe_keys = [k for k in dedupe_keys if k]
     ts_col = next((c for c in ts_cols if c in df.columns), None)
-    if not ts_col:
-        deduped = df.dropDuplicates(dedupe_keys)
-    else:
-        w = Window.partitionBy(*dedupe_keys).orderBy(col(ts_col).desc_nulls_last())
-        deduped = df.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
-    removed = df.exceptAll(deduped)
+    order_col = col(ts_col).desc_nulls_last() if ts_col else F.lit(1)
+    w = Window.partitionBy(*dedupe_keys).orderBy(order_col)
+    ranked = df.withColumn("_rn", row_number().over(w))
+    deduped = ranked.filter(col("_rn") == 1).drop("_rn")
+    removed = ranked.filter(col("_rn") > 1).drop("_rn")
     return deduped, removed
 
 def dedupe_txn_rel_specific(df, label: str, comment_cols: List[str]):
