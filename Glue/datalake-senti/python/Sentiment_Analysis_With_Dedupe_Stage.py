@@ -819,47 +819,56 @@ ivr_agg = None
 txn_agg = None
 rel_agg = None
 
+# Each source is read/aggregated independently -- NOT gated on whether the
+# LAST date_to_process in the loop above happened to have data for that
+# source. A source having no data on the final date processed does not mean
+# it has no historical data at all; gating on ivr_final/txn_final/rel_final
+# here would silently skip a source's cumulative aggregate for the whole
+# run just because its most recent date was empty.
 try:
-    # Read entire FINAL_IVR_PATH, then scope to the current calendar year
-    if ivr_final is not None:
-        ivr_all_history = spark.read.parquet(FINAL_IVR_PATH.rstrip("/")) \
-            .filter(F.year(F.col("event_date")) == current_year)
-        ivr_agg = ivr_all_history.agg(
-            F.avg("q1_csat_with_ivr").alias("q1_avg_csat"),
-            F.avg("q2_ease_with_ivr").alias("q2_avg_csat"),
-            F.avg("q3_csat_with_pseg_li").alias("q3_avg_csat"),
-            F.min("event_date").alias("event_start_date"),
-            F.max("event_date").alias("event_end_date")
-        ).withColumn("calculated_date", calculated_date)
-        print(f"[DAILY AGG] IVR: read {ivr_all_history.count()} records for year {current_year}, computed cumulative average")
+    ivr_all_history = spark.read.parquet(FINAL_IVR_PATH.rstrip("/")) \
+        .filter(F.year(F.col("event_date")) == current_year)
+    ivr_agg = ivr_all_history.agg(
+        F.avg("q1_csat_with_ivr").alias("q1_avg_csat"),
+        F.avg("q2_ease_with_ivr").alias("q2_avg_csat"),
+        F.avg("q3_csat_with_pseg_li").alias("q3_avg_csat"),
+        F.min("event_date").alias("event_start_date"),
+        F.max("event_date").alias("event_end_date")
+    ).withColumn("calculated_date", calculated_date)
+    print(f"[DAILY AGG] IVR: read {ivr_all_history.count()} records for year {current_year}, computed cumulative average")
+except Exception as e:
+    print(f"[DAILY AGG] IVR: no historical data found at {FINAL_IVR_PATH} for year {current_year}, skipping. ({str(e)})")
 
-    # Read entire FINAL_TXN_PATH, then scope to the current calendar year
-    if txn_final is not None:
-        txn_all_history = spark.read.parquet(FINAL_TXN_PATH.rstrip("/")) \
-            .filter(F.year(F.col("event_date")) == current_year)
-        txn_agg = txn_all_history.agg(
-            F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
-            F.avg("q2_effort_value").alias("q2_avg_csat"),
-            F.avg("q3_overall_satisfaction").alias("q3_avg_csat"),
-            F.min("event_date").alias("event_start_date"),
-            F.max("event_date").alias("event_end_date")
-        ).withColumn("calculated_date", calculated_date)
-        print(f"[DAILY AGG] TXN: read {txn_all_history.count()} records for year {current_year}, computed cumulative average")
+try:
+    txn_all_history = spark.read.parquet(FINAL_TXN_PATH.rstrip("/")) \
+        .filter(F.year(F.col("event_date")) == current_year)
+    txn_agg = txn_all_history.agg(
+        F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q2_effort_value").alias("q2_avg_csat"),
+        F.avg("q3_overall_satisfaction").alias("q3_avg_csat"),
+        F.min("event_date").alias("event_start_date"),
+        F.max("event_date").alias("event_end_date")
+    ).withColumn("calculated_date", calculated_date)
+    print(f"[DAILY AGG] TXN: read {txn_all_history.count()} records for year {current_year}, computed cumulative average")
+except Exception as e:
+    print(f"[DAILY AGG] TXN: no historical data found at {FINAL_TXN_PATH} for year {current_year}, skipping. ({str(e)})")
 
-    # Read entire FINAL_REL_PATH, then scope to the current calendar year
-    if rel_final is not None:
-        rel_all_history = spark.read.parquet(FINAL_REL_PATH.rstrip("/")) \
-            .filter(F.year(F.col("event_date")) == current_year)
-        rel_agg = rel_all_history.agg(
-            F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
-            F.avg("q3_effort_value").alias("q2_avg_csat"),
-            F.avg("q4_overall_satisfaction").alias("q3_avg_csat"),
-            F.min("event_date").alias("event_start_date"),
-            F.max("event_date").alias("event_end_date")
-        ).withColumn("calculated_date", calculated_date)
-        print(f"[DAILY AGG] REL: read {rel_all_history.count()} records for year {current_year}, computed cumulative average")
+try:
+    rel_all_history = spark.read.parquet(FINAL_REL_PATH.rstrip("/")) \
+        .filter(F.year(F.col("event_date")) == current_year)
+    rel_agg = rel_all_history.agg(
+        F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q3_effort_value").alias("q2_avg_csat"),
+        F.avg("q4_overall_satisfaction").alias("q3_avg_csat"),
+        F.min("event_date").alias("event_start_date"),
+        F.max("event_date").alias("event_end_date")
+    ).withColumn("calculated_date", calculated_date)
+    print(f"[DAILY AGG] REL: read {rel_all_history.count()} records for year {current_year}, computed cumulative average")
+except Exception as e:
+    print(f"[DAILY AGG] REL: no historical data found at {FINAL_REL_PATH} for year {current_year}, skipping. ({str(e)})")
 
-    # WRITE AGG (one file per survey type, overwrite mode)
+# WRITE AGG (one file per survey type, overwrite mode)
+try:
     print("Writing daily aggregate files (overwrite)")
     if ivr_agg is not None:
         write_single_file(ivr_agg, AGG_IVR_FILE, AGG_IVR_TMP, "IVR AGG")
@@ -868,9 +877,8 @@ try:
     if rel_agg is not None:
         write_single_file(rel_agg, AGG_REL_FILE, AGG_REL_TMP, "REL AGG")
     print("Daily aggregate files written successfully")
-
 except Exception as e:
-    logger.error(f"Failed to compute/write daily aggregates. Error: {str(e)}")
+    logger.error(f"Failed to write daily aggregate files. Error: {str(e)}")
     raise
 
 # TRACKER TABLE WRITE: this job is now the sole writer of the per-day tracker
