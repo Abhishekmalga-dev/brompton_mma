@@ -33,6 +33,19 @@ STAGING_SEGMENT = "" if STAGING == "dev" else STAGING
 sc = SparkContext.getOrCreate()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
+
+# Force modern TIMESTAMP_MICROS parquet encoding for this job's own writes
+# (FINAL_*_PATH, AGG_*_FILE, YTD_*_FILE). Without this, Spark defaults to
+# the legacy INT96 timestamp encoding, which readers that don't specifically
+# decode INT96 (S3 Select, some downstream jobs relying on a Glue Catalog
+# schema) will misread as garbage scientific-notation numbers -- e.g.
+# response_received_date, event_ts, queue_time, all passed through from the
+# curated read into ivr_final/txn_final/rel_final and written back out here.
+# NOTE: this only affects NEW writes going forward. It does not retroactively
+# fix already-written historical partitions under FINAL_*_PATH -- those
+# still need a separate read+rewrite pass, same as the upstream job.
+spark.conf.set("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
+
 logger = glueContext.get_logger()
 print(f"Processing mode received: {processing_mode}")
 
@@ -102,6 +115,16 @@ AGG_IVR_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ag
 AGG_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_txn")
 AGG_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_rel")
 
+# Removed-records CSV output (campaign filter + dedupe), one file per
+# survey type per event_date.
+REMOVED_RECORDS_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/ivr")
+REMOVED_RECORDS_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/txn")
+REMOVED_RECORDS_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/rel")
+
+REMOVED_RECORDS_IVR_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_ivr")
+REMOVED_RECORDS_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_txn")
+REMOVED_RECORDS_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_rel")
+
 # HELPERS
 
 def write_single_file(df, final_path: str, tmp_path: str, label: str):
@@ -139,13 +162,57 @@ def write_single_file(df, final_path: str, tmp_path: str, label: str):
 
     print(f"[{label}] Written to {final_path}")
 
+def write_removed_records_csv(df, final_path: str, tmp_path: str, label: str):
+    """Same staging/copy/cleanup pattern as write_single_file, adapted for a
+    single-file CSV with a header row instead of parquet."""
+    print(f"[{label}] Writing removed-records CSV output")
+
+    df.coalesce(1).write.mode("overwrite").option("header", "true").csv(tmp_path)
+
+    tmp_bucket = tmp_path.replace("s3://", "").split("/")[0]
+    tmp_prefix = "/".join(tmp_path.replace("s3://", "").split("/")[1:])
+
+    resp = s3.list_objects_v2(Bucket=tmp_bucket, Prefix=tmp_prefix)
+    contents = resp.get("Contents", [])
+    part_key = None
+    for obj in contents:
+        if obj["Key"].endswith(".csv"):
+            part_key = obj["Key"]
+            break
+
+    if not part_key:
+        logger.error(f"[{label}] No CSV part file found in temp path {tmp_path}")
+        return
+
+    final_bucket = final_path.replace("s3://", "").split("/")[0]
+    final_key = "/".join(final_path.replace("s3://", "").split("/")[1:])
+
+    s3.copy_object(
+        Bucket=final_bucket,
+        CopySource={"Bucket": tmp_bucket, "Key": part_key},
+        Key=final_key
+    )
+
+    for obj in contents:
+        s3.delete_object(Bucket=tmp_bucket, Key=obj["Key"])
+
+    print(f"[{label}] Removed-records CSV written to {final_path}")
+
 def batch_level_dedup(df, dedupe_keys: List[str], ts_cols: List[str]):
+    """
+    Returns (deduped, removed). The logic that decides which rows are KEPT is
+    unchanged from before; removed rows are simply the set-difference
+    (df.exceptAll(deduped)) so we can report/export exactly what got dropped.
+    """
     dedupe_keys = [k for k in dedupe_keys if k]
     ts_col = next((c for c in ts_cols if c in df.columns), None)
     if not ts_col:
-        return df.dropDuplicates(dedupe_keys)
-    w = Window.partitionBy(*dedupe_keys).orderBy(col(ts_col).desc_nulls_last())
-    return df.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
+        deduped = df.dropDuplicates(dedupe_keys)
+    else:
+        w = Window.partitionBy(*dedupe_keys).orderBy(col(ts_col).desc_nulls_last())
+        deduped = df.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
+    removed = df.exceptAll(deduped)
+    return deduped, removed
 
 def dedupe_txn_rel_specific(df, label: str, comment_cols: List[str]):
     """
@@ -235,7 +302,15 @@ def dedupe_txn_rel_specific(df, label: str, comment_cols: List[str]):
 
     print("#" * 60)
 
-    return final_df
+    # Build a combined removed-records dataframe (all 3 cases, tagged with
+    # which case caused removal), for CSV export purposes.
+    removed_cols = ["response_received_date", "cas_account_number"]
+    case1_tagged = case1_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_1"))
+    case2_tagged = case2_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_2"))
+    case3_tagged = case3_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_3"))
+    all_removed = case1_tagged.unionByName(case2_tagged).unionByName(case3_tagged)
+
+    return final_df, all_removed
 
 def normalize_ivr(df):
     return df.withColumn("q1_csat_with_ivr", F.col("q1_csat_with_ivr_value").cast(DoubleType())) \
@@ -349,6 +424,10 @@ for event_date_value in dates_to_process:
     ivr_new_records_found = False
     txn_new_records_found = False
     rel_new_records_found = False
+    ivr_campaign_removed_df = None
+    ivr_dedup_removed = None
+    txn_dedup_removed = None
+    rel_dedup_removed = None
 
     # READ CURATED
     print("Reading available curated datasets")
@@ -370,6 +449,7 @@ for event_date_value in dates_to_process:
         # CAMPAIGN FILTER: keep only "Main" campaign records
         ivr_pre_campaign_count = ivr_raw.count()
         if "campaign" in ivr_raw.columns:
+            ivr_campaign_removed_df = ivr_raw.filter(F.col("campaign") != "Main")
             ivr_raw = ivr_raw.filter(F.col("campaign") == "Main")
         ivr_post_campaign_count = ivr_raw.count()
         ivr_campaign_removed = ivr_pre_campaign_count - ivr_post_campaign_count
@@ -449,14 +529,14 @@ for event_date_value in dates_to_process:
     ts_cols = ["response_received_date", "event_ts"]
 
     if ivr_final is not None:
-        ivr_final = batch_level_dedup(ivr_final, dedupe_keys, ts_cols)
+        ivr_final, ivr_dedup_removed = batch_level_dedup(ivr_final, dedupe_keys, ts_cols)
     if txn_final is not None:
-        txn_final = dedupe_txn_rel_specific(
+        txn_final, txn_dedup_removed = dedupe_txn_rel_specific(
             txn_final, "TXN",
             comment_cols=["q4_comment_in_survey_language_sms", "q4_comment_sms"]
         )
     if rel_final is not None:
-        rel_final = dedupe_txn_rel_specific(
+        rel_final, rel_dedup_removed = dedupe_txn_rel_specific(
             rel_final, "REL",
             comment_cols=["q5_comment_in_survey_language_sms", "q5_comment_sms"]
         )
@@ -464,6 +544,63 @@ for event_date_value in dates_to_process:
     print(f"IVR final count after dedupe: {ivr_final.count() if ivr_final is not None else 'N/A'}")
     print(f"TXN final count after dedupe: {txn_final.count() if txn_final is not None else 'N/A'}")
     print(f"REL final count after dedupe: {rel_final.count() if rel_final is not None else 'N/A'}")
+
+    # REMOVED RECORDS CSV: one file per survey type per event_date, combining
+    # campaign-filter removals (IVR only) and dedupe removals (all 3), with a
+    # removal_reason column to distinguish. Uses cas_account_number as the
+    # key identifier, per requirement.
+    try:
+        removed_cols = ["response_received_date", "cas_account_number"]
+
+        ivr_removed_parts = []
+        if ivr_campaign_removed_df is not None and ivr_campaign_removed_df.count() > 0:
+            ivr_removed_parts.append(
+                ivr_campaign_removed_df.select(*[c for c in removed_cols if c in ivr_campaign_removed_df.columns])
+                .withColumn("removal_reason", F.lit("CAMPAIGN_FILTER_NON_MAIN"))
+            )
+        if ivr_dedup_removed is not None and ivr_dedup_removed.count() > 0:
+            ivr_removed_parts.append(
+                ivr_dedup_removed.select(*[c for c in removed_cols if c in ivr_dedup_removed.columns])
+                .withColumn("removal_reason", F.lit("DEDUP"))
+            )
+        if ivr_removed_parts:
+            ivr_removed_combined = ivr_removed_parts[0]
+            for part in ivr_removed_parts[1:]:
+                ivr_removed_combined = ivr_removed_combined.unionByName(part)
+            ivr_removed_combined = ivr_removed_combined \
+                .withColumn("survey_type", F.lit("IVR")) \
+                .withColumn("event_date", F.lit(event_date_value))
+            write_removed_records_csv(
+                ivr_removed_combined,
+                f"{REMOVED_RECORDS_IVR_PATH}event_date={event_date_value}/removed_records.csv",
+                REMOVED_RECORDS_IVR_TMP,
+                "IVR REMOVED RECORDS"
+            )
+
+        if txn_dedup_removed is not None and txn_dedup_removed.count() > 0:
+            txn_removed_combined = txn_dedup_removed \
+                .withColumn("survey_type", F.lit("TXN")) \
+                .withColumn("event_date", F.lit(event_date_value))
+            write_removed_records_csv(
+                txn_removed_combined,
+                f"{REMOVED_RECORDS_TXN_PATH}event_date={event_date_value}/removed_records.csv",
+                REMOVED_RECORDS_TXN_TMP,
+                "TXN REMOVED RECORDS"
+            )
+
+        if rel_dedup_removed is not None and rel_dedup_removed.count() > 0:
+            rel_removed_combined = rel_dedup_removed \
+                .withColumn("survey_type", F.lit("REL")) \
+                .withColumn("event_date", F.lit(event_date_value))
+            write_removed_records_csv(
+                rel_removed_combined,
+                f"{REMOVED_RECORDS_REL_PATH}event_date={event_date_value}/removed_records.csv",
+                REMOVED_RECORDS_REL_TMP,
+                "REL REMOVED RECORDS"
+            )
+    except Exception as e:
+        logger.error(f"Failed to write removed-records CSV files for event_date={event_date_value}. Error: {str(e)}")
+        raise
 
     # WRITE FINAL (partitioned by event_date)
 
@@ -654,23 +791,26 @@ for event_date_value in dates_to_process:
     })
 
 # DAILY AGGREGATES (computed once after all dates processed)
-# This is a cumulative/rolling average across ALL historical data currently
-# in the FINAL_* paths, then overwrites the daily aggregate files.
-# Schema: event_start_date (earliest event_date in the data),
-# event_end_date (latest event_date in the data), calculated_date (today,
-# i.e. when this aggregate was computed) — plus the avg score columns.
+# This is a cumulative/rolling average across the CURRENT CALENDAR YEAR's data
+# only (resets every January 1st), then overwrites the daily aggregate files.
+# Schema: event_start_date (earliest event_date in the current year's data),
+# event_end_date (latest event_date in the current year's data),
+# calculated_date (today, i.e. when this aggregate was computed) — plus the
+# avg score columns.
 
-print("Computing daily aggregates (cumulative across all historical data)")
+print("Computing daily aggregates (cumulative across current calendar year)")
 calculated_date = F.lit(date.today()).cast(DateType())
+current_year = date.today().year
 
 ivr_agg = None
 txn_agg = None
 rel_agg = None
 
 try:
-    # Read entire FINAL_IVR_PATH (all partitions, all historical data)
+    # Read entire FINAL_IVR_PATH, then scope to the current calendar year
     if ivr_final is not None:
-        ivr_all_history = spark.read.parquet(FINAL_IVR_PATH.rstrip("/"))
+        ivr_all_history = spark.read.parquet(FINAL_IVR_PATH.rstrip("/")) \
+            .filter(F.year(F.col("event_date")) == current_year)
         ivr_agg = ivr_all_history.agg(
             F.avg("q1_csat_with_ivr").alias("q1_avg_csat"),
             F.avg("q2_ease_with_ivr").alias("q2_avg_csat"),
@@ -678,11 +818,12 @@ try:
             F.min("event_date").alias("event_start_date"),
             F.max("event_date").alias("event_end_date")
         ).withColumn("calculated_date", calculated_date)
-        print(f"[DAILY AGG] IVR: read {ivr_all_history.count()} total records, computed cumulative average")
+        print(f"[DAILY AGG] IVR: read {ivr_all_history.count()} records for year {current_year}, computed cumulative average")
 
-    # Read entire FINAL_TXN_PATH (all partitions, all historical data)
+    # Read entire FINAL_TXN_PATH, then scope to the current calendar year
     if txn_final is not None:
-        txn_all_history = spark.read.parquet(FINAL_TXN_PATH.rstrip("/"))
+        txn_all_history = spark.read.parquet(FINAL_TXN_PATH.rstrip("/")) \
+            .filter(F.year(F.col("event_date")) == current_year)
         txn_agg = txn_all_history.agg(
             F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
             F.avg("q2_effort_value").alias("q2_avg_csat"),
@@ -690,11 +831,12 @@ try:
             F.min("event_date").alias("event_start_date"),
             F.max("event_date").alias("event_end_date")
         ).withColumn("calculated_date", calculated_date)
-        print(f"[DAILY AGG] TXN: read {txn_all_history.count()} total records, computed cumulative average")
+        print(f"[DAILY AGG] TXN: read {txn_all_history.count()} records for year {current_year}, computed cumulative average")
 
-    # Read entire FINAL_REL_PATH (all partitions, all historical data)
+    # Read entire FINAL_REL_PATH, then scope to the current calendar year
     if rel_final is not None:
-        rel_all_history = spark.read.parquet(FINAL_REL_PATH.rstrip("/"))
+        rel_all_history = spark.read.parquet(FINAL_REL_PATH.rstrip("/")) \
+            .filter(F.year(F.col("event_date")) == current_year)
         rel_agg = rel_all_history.agg(
             F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
             F.avg("q3_effort_value").alias("q2_avg_csat"),
@@ -702,7 +844,7 @@ try:
             F.min("event_date").alias("event_start_date"),
             F.max("event_date").alias("event_end_date")
         ).withColumn("calculated_date", calculated_date)
-        print(f"[DAILY AGG] REL: read {rel_all_history.count()} total records, computed cumulative average")
+        print(f"[DAILY AGG] REL: read {rel_all_history.count()} records for year {current_year}, computed cumulative average")
 
     # WRITE AGG (one file per survey type, overwrite mode)
     print("Writing daily aggregate files (overwrite)")
