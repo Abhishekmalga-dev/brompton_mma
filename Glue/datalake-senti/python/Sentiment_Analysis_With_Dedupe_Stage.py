@@ -379,7 +379,7 @@ def safe_read_parquet(path, label):
 # EVENT DATE
 try:
     if processing_mode == "manual":
-        dates_to_process = ["2026-07-01","2026-07-02","2026-07-03","2026-07-04","2026-07-05","2026-07-06","2026-07-07"]
+        dates_to_process = ["2026-01-01","2026-01-02","2026-01-03","2026-01-04","2026-01-05","2026-01-06","2026-01-07"]
         print(f"Manual mode, date={dates_to_process}")
     else:
         print("Auto mode: reading event_date from JSON")
@@ -703,6 +703,7 @@ for event_date_value in dates_to_process:
 
     # YTD AGGREGATES (inside loop, one row per date per survey type)
 
+    daily_date = F.lit(event_date_value).cast(DateType())
     today = F.current_date()
 
     ivr_ytd = None
