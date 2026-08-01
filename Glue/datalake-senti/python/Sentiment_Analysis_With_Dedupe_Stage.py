@@ -208,6 +208,12 @@ def batch_level_dedup(df, dedupe_keys: List[str], ts_cols: List[str]):
     referenced -- "Couldn't find new_intent#N in [...]"). Deriving both
     outputs from one ranked DataFrame avoids that entirely, matching the
     approach already used safely in dedupe_txn_rel_specific.
+
+    NOTE: previously, when no ts_col was available, this fell back to
+    df.dropDuplicates(dedupe_keys) (Spark's native non-deterministic tie
+    break). That fallback now uses the same windowed-rank approach with an
+    arbitrary order (F.lit(1)) instead -- still keeps exactly one row per
+    dedupe_keys group, just via a different (exceptAll-free) mechanism.
     """
     dedupe_keys = [k for k in dedupe_keys if k]
     ts_col = next((c for c in ts_cols if c in df.columns), None)
@@ -308,7 +314,7 @@ def dedupe_txn_rel_specific(df, label: str, comment_cols: List[str]):
 
     # Build a combined removed-records dataframe (all 3 cases, tagged with
     # which case caused removal), for CSV export purposes.
-    removed_cols = ["response_received_date", "cas_account_number"]
+    removed_cols = [c for c in ["response_received_date", "cas_account_number", "customer_account_number"] if c in df.columns]
     case1_tagged = case1_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_1"))
     case2_tagged = case2_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_2"))
     case3_tagged = case3_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_3"))
@@ -379,7 +385,7 @@ def safe_read_parquet(path, label):
 # EVENT DATE
 try:
     if processing_mode == "manual":
-        dates_to_process = ["2026-01-01","2026-01-02","2026-01-03","2026-01-04","2026-01-05","2026-01-06","2026-01-07"]
+        dates_to_process = ["2026-07-01","2026-07-02","2026-07-03","2026-07-04","2026-07-05","2026-07-06","2026-07-07"]
         print(f"Manual mode, date={dates_to_process}")
     else:
         print("Auto mode: reading event_date from JSON")
@@ -551,10 +557,12 @@ for event_date_value in dates_to_process:
 
     # REMOVED RECORDS CSV: one file per survey type per event_date, combining
     # campaign-filter removals (IVR only) and dedupe removals (all 3), with a
-    # removal_reason column to distinguish. Uses cas_account_number as the
-    # key identifier, per requirement.
+    # removal_reason column to distinguish. Uses cas_account_number and
+    # customer_account_number as key identifiers (whichever exist for a
+    # given survey type -- IVR's raw schema appears to use
+    # customer_account_number rather than cas_account_number).
     try:
-        removed_cols = ["response_received_date", "cas_account_number"]
+        removed_cols = ["response_received_date", "cas_account_number", "customer_account_number"]
 
         ivr_removed_parts = []
         if ivr_campaign_removed_df is not None and ivr_campaign_removed_df.count() > 0:
