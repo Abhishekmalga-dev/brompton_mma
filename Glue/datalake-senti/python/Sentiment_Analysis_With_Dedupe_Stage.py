@@ -356,7 +356,11 @@ def normalize_rel(df):
 def normalize_api_txn(df):
     return df.withColumn("q1_satisfaction_value", F.col("q1_satisfaction_value").cast(DoubleType())) \
         .withColumn("q2_effort_value", F.col("q2_effort_value").cast(DoubleType())) \
-        .withColumn("q3_overall_satisfaction", F.col("q3_overall_satisfaction_value").cast(DoubleType()))
+        .withColumn("q3_overall_satisfaction", F.col("q3_overall_satisfaction_value").cast(DoubleType())) \
+        .withColumn("q1_question_text", F.lit("How would you rate your overall satisfaction with this visit")) \
+        .withColumn("q2_question_text", F.lit("How would you rate your satisfaction with the level of effort required to complete your transaction during this visit")) \
+        .withColumn("q3_question_text", F.lit("How would you rate your overall satisfaction with the service you receive from PSEG Long Island")) \
+        .withColumn("q4_question_text", F.lit("Do you have additional feedback regarding your transaction for this visit"))
 
 def normalize_api_rel(df):
     # web_relational_survey_q2_satisfaction holds values like "5 - Very Satisfied" --
@@ -366,7 +370,12 @@ def normalize_api_rel(df):
             F.regexp_extract(F.col("web_relational_survey_q2_satisfaction"), r"^(\d+)", 1).cast(DoubleType())
         ) \
         .withColumn("q3_effort_value", F.col("q3_effort_value").cast(DoubleType())) \
-        .withColumn("q4_overall_satisfaction", F.col("q4_overall_satisfaction_value").cast(DoubleType()))
+        .withColumn("q4_overall_satisfaction", F.col("q4_overall_satisfaction_value").cast(DoubleType())) \
+        .withColumn("q1_question_text", F.lit("Enter the reasons for this MyAccount visit")) \
+        .withColumn("q2_question_text", F.lit("How would you rate your overall satisfaction with this transaction")) \
+        .withColumn("q3_question_text", F.lit("How would you rate your satisfaction with the level of effort required to complete your transaction during this visit")) \
+        .withColumn("q4_question_text", F.lit("How would you rate your overall satisfaction overall with PSEGLI")) \
+        .withColumn("q5_question_text", F.lit("Please provide the reason for the satisfaction score you just gave"))
 
 def apply_intent(df, intent_map_df):
     print("Applying intent mapping")
