@@ -31,6 +31,8 @@ def lambda_handler(event, context):
             "ivr_available": False,
             "sms_web_relational_available": False,
             "sms_web_transactional_available": False,
+            "api_web_transactional_available": False,
+            "api_web_relational_available": False,
             "execution_date": execution_date,
             "lookup_status": "NOT_FOUND"
         }
@@ -41,6 +43,8 @@ def lambda_handler(event, context):
         "ivr_available": bool(item.get("ivr_available", False)),
         "sms_web_relational_available": bool(item.get("sms_web_relational_available", False)),
         "sms_web_transactional_available": bool(item.get("sms_web_transactional_available", False)),
+        "api_web_transactional_available": bool(item.get("api_web_transactional_available", False)),
+        "api_web_relational_available": bool(item.get("api_web_relational_available", False)),
         "execution_date": execution_date,
         "lookup_status": "FOUND"
     }

@@ -149,7 +149,7 @@
           "Next": "StartComprehendJob_SMSTransactional"
         }
       ],
-      "Default": "StartComprehendJob_IVR"
+      "Default": "CheckAPITransactionalAvailability"
     },
     "StartComprehendJob_SMSTransactional": {
       "Type": "Task",
@@ -177,6 +177,116 @@
       "Next": "CheckComprehendStatus_SMSTransactional"
     },
     "CheckComprehendStatus_SMSTransactional": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "CheckAPITransactionalAvailability"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "CheckAPITransactionalAvailability": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.availability_result.Payload.api_web_transactional_available",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.availability_result.Payload.api_web_transactional_available",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "StartComprehendJob_APITransactional"
+        }
+      ],
+      "Default": "CheckAPIRelationalAvailability"
+    },
+    "StartComprehendJob_APITransactional": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": false,
+          "source": "api_web_transactional",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckComprehendStatus_APITransactional"
+    },
+    "CheckComprehendStatus_APITransactional": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.comprehend_pipeline_result.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "CheckAPIRelationalAvailability"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "CheckAPIRelationalAvailability": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.availability_result.Payload.api_web_relational_available",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.availability_result.Payload.api_web_relational_available",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "StartComprehendJob_APIRelational"
+        }
+      ],
+      "Default": "StartComprehendJob_IVR"
+    },
+    "StartComprehendJob_APIRelational": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:053234861925:stateMachine:datalake-comprehend-pipeline-temp-dev",
+        "Input": {
+          "load_mode": "APPEND_MISSING",
+          "dates": [],
+          "update_rds": true,
+          "create_endpoints": true,
+          "delete_endpoints": false,
+          "source": "api_web_relational",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.comprehend_pipeline_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckComprehendStatus_APIRelational"
+    },
+    "CheckComprehendStatus_APIRelational": {
       "Type": "Choice",
       "Choices": [
         {

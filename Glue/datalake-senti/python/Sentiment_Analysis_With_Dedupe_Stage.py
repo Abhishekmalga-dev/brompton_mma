@@ -87,43 +87,59 @@ EVENT_DATE_PATH = build_path(TEMP_BUCKET, STAGING_SEGMENT, "ccaas/event_dates/su
 CURATED_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "ccaas/survey_customer_sat_ivr")
 CURATED_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "ccaas/survey_sms_web_transactional")
 CURATED_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "ccaas/survey_sms_web_relational")
+CURATED_API_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "ccaas/survey_api_web_transactional")
+CURATED_API_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "ccaas/survey_api_web_relational")
 
 INTENT_MAPPING_PATH = build_path(TEMP_BUCKET, STAGING_SEGMENT, "sentiment_analysis/Intent_Mapping")
 
 FINAL_IVR_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/staging/ivr")
-FINAL_TXN_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/staging/txn")
-FINAL_REL_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/staging/rel")
+FINAL_TXN_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/staging/sms_transactional")
+FINAL_REL_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/staging/sms_relational")
+FINAL_API_TXN_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/staging/api_transactional")
+FINAL_API_REL_STAGING = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/staging/api_relational")
 
 FINAL_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/ivr")
-FINAL_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/transactional")
-FINAL_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/relational")
+FINAL_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/sms_transactional")
+FINAL_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/sms_relational")
+FINAL_API_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/api_transactional")
+FINAL_API_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/final/api_relational")
 
 # AGG_*_FILE are single-file S3 keys (end in .parquet), not folders.
 # build_path() always appends a trailing slash, so we rstrip it back off
 # here to preserve the exact original no-trailing-slash file path while
 # still deriving ENV/STAGING through the shared helper.
 AGG_IVR_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/ivr.parquet").rstrip("/")
-AGG_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/txn.parquet").rstrip("/")
-AGG_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/rel.parquet").rstrip("/")
+AGG_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/sms_transactional.parquet").rstrip("/")
+AGG_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/sms_relational.parquet").rstrip("/")
+AGG_API_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/api_transactional.parquet").rstrip("/")
+AGG_API_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/api_relational.parquet").rstrip("/")
 
 YTD_IVR_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ytd/ivr").rstrip("/")
-YTD_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ytd/txn").rstrip("/")
-YTD_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ytd/rel").rstrip("/")
+YTD_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ytd/sms_transactional").rstrip("/")
+YTD_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ytd/sms_relational").rstrip("/")
+YTD_API_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ytd/api_transactional").rstrip("/")
+YTD_API_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ytd/api_relational").rstrip("/")
 
 # temp folders for single-file writes
 AGG_IVR_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_ivr")
-AGG_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_txn")
-AGG_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_rel")
+AGG_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_sms_transactional")
+AGG_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_sms_relational")
+AGG_API_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_api_transactional")
+AGG_API_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_api_relational")
 
 # Removed-records CSV output (campaign filter + dedupe), one file per
 # survey type per event_date.
 REMOVED_RECORDS_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/ivr")
-REMOVED_RECORDS_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/txn")
-REMOVED_RECORDS_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/rel")
+REMOVED_RECORDS_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/sms_transactional")
+REMOVED_RECORDS_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/sms_relational")
+REMOVED_RECORDS_API_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/api_transactional")
+REMOVED_RECORDS_API_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/api_relational")
 
 REMOVED_RECORDS_IVR_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_ivr")
-REMOVED_RECORDS_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_txn")
-REMOVED_RECORDS_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_rel")
+REMOVED_RECORDS_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_sms_transactional")
+REMOVED_RECORDS_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_sms_relational")
+REMOVED_RECORDS_API_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_api_transactional")
+REMOVED_RECORDS_API_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_api_relational")
 
 # HELPERS
 
@@ -337,6 +353,21 @@ def normalize_rel(df):
         .withColumn("q3_effort_value", F.col("q3_effort_value_sms").cast(DoubleType())) \
         .withColumn("q4_overall_satisfaction", F.col("q4_overall_satisfaction_value_sms").cast(DoubleType()))
 
+def normalize_api_txn(df):
+    return df.withColumn("q1_satisfaction_value", F.col("q1_satisfaction_value").cast(DoubleType())) \
+        .withColumn("q2_effort_value", F.col("q2_effort_value").cast(DoubleType())) \
+        .withColumn("q3_overall_satisfaction", F.col("q3_overall_satisfaction_value").cast(DoubleType()))
+
+def normalize_api_rel(df):
+    # web_relational_survey_q2_satisfaction holds values like "5 - Very Satisfied" --
+    # extract the leading numeric portion only, per requirement, before casting.
+    return df.withColumn(
+            "q2_satisfaction_value",
+            F.regexp_extract(F.col("web_relational_survey_q2_satisfaction"), r"^(\d+)", 1).cast(DoubleType())
+        ) \
+        .withColumn("q3_effort_value", F.col("q3_effort_value").cast(DoubleType())) \
+        .withColumn("q4_overall_satisfaction", F.col("q4_overall_satisfaction_value").cast(DoubleType()))
+
 def apply_intent(df, intent_map_df):
     print("Applying intent mapping")
     intent_map_clean = (
@@ -427,17 +458,25 @@ for event_date_value in dates_to_process:
     ivr_raw = None
     txn_raw = None
     rel_raw = None
+    api_txn_raw = None
+    api_rel_raw = None
     ivr_final = None
     txn_final = None
     rel_final = None
+    api_txn_final = None
+    api_rel_final = None
     ivr_campaign_removed = 0
     ivr_new_records_found = False
     txn_new_records_found = False
     rel_new_records_found = False
+    api_txn_new_records_found = False
+    api_rel_new_records_found = False
     ivr_campaign_removed_df = None
     ivr_dedup_removed = None
     txn_dedup_removed = None
     rel_dedup_removed = None
+    api_txn_dedup_removed = None
+    api_rel_dedup_removed = None
 
     # READ CURATED
     print("Reading available curated datasets")
@@ -487,7 +526,27 @@ for event_date_value in dates_to_process:
     else:
         print(f"[INPUT COUNT] REL: No data found / skipped")
 
-    if ivr_raw is None and txn_raw is None and rel_raw is None:
+    print(f"api txn read path: {CURATED_API_TXN_PATH}event_date={event_date_value}/")
+    api_txn_raw = safe_read_parquet(
+        f"{CURATED_API_TXN_PATH}event_date={event_date_value}/",
+        "API TXN"
+    )
+    if api_txn_raw is not None:
+        print(f"[INPUT COUNT] API TXN records received: {api_txn_raw.count()}")
+    else:
+        print(f"[INPUT COUNT] API TXN: No data found / skipped")
+
+    print(f"api rel read path: {CURATED_API_REL_PATH}event_date={event_date_value}/")
+    api_rel_raw = safe_read_parquet(
+        f"{CURATED_API_REL_PATH}event_date={event_date_value}/",
+        "API REL"
+    )
+    if api_rel_raw is not None:
+        print(f"[INPUT COUNT] API REL records received: {api_rel_raw.count()}")
+    else:
+        print(f"[INPUT COUNT] API REL: No data found / skipped")
+
+    if ivr_raw is None and txn_raw is None and rel_raw is None and api_txn_raw is None and api_rel_raw is None:
         print(f"[SKIP] No data for event_date={event_date_value}. Moving to next date.")
         all_dates_processed.append(event_date_value)
         source_new_records_report.append({
@@ -495,6 +554,8 @@ for event_date_value in dates_to_process:
             "ivr_new_records_found": False,
             "sms_web_transactional_new_records_found": False,
             "sms_web_relational_new_records_found": False,
+            "api_web_transactional_new_records_found": False,
+            "api_web_relational_new_records_found": False,
         })
         continue
 
@@ -524,6 +585,22 @@ for event_date_value in dates_to_process:
     else:
         logger.info("REL not available. Skipping REL processing")
 
+    if api_txn_raw is not None:
+        api_txn_final = normalize_api_txn(api_txn_raw)
+        api_txn_final = apply_intent(api_txn_final, intent_map_df)
+        api_txn_final = ensure_event_date(api_txn_final, event_date_value)
+        print(f"[PROCESSED COUNT] API TXN records after normalize+intent+dedup: {api_txn_final.count()}")
+    else:
+        logger.info("API TXN not available. Skipping API TXN processing")
+
+    if api_rel_raw is not None:
+        api_rel_final = normalize_api_rel(api_rel_raw)
+        api_rel_final = apply_intent(api_rel_final, intent_map_df)
+        api_rel_final = ensure_event_date(api_rel_final, event_date_value)
+        print(f"[PROCESSED COUNT] API REL records after normalize+intent+dedup: {api_rel_final.count()}")
+    else:
+        logger.info("API REL not available. Skipping API REL processing")
+
     # DEDUPE
 
     dedupe_keys = [
@@ -550,10 +627,22 @@ for event_date_value in dates_to_process:
             rel_final, "REL",
             comment_cols=["q5_comment_in_survey_language_sms", "q5_comment_sms"]
         )
+    if api_txn_final is not None:
+        api_txn_final, api_txn_dedup_removed = dedupe_txn_rel_specific(
+            api_txn_final, "API TXN",
+            comment_cols=["q4_feedback_comment_in_survey_language", "q4_feedback_comment"]
+        )
+    if api_rel_final is not None:
+        api_rel_final, api_rel_dedup_removed = dedupe_txn_rel_specific(
+            api_rel_final, "API REL",
+            comment_cols=["q5_feedback_comment_in_survey_language", "q5_feedback_comment"]
+        )
 
     print(f"IVR final count after dedupe: {ivr_final.count() if ivr_final is not None else 'N/A'}")
     print(f"TXN final count after dedupe: {txn_final.count() if txn_final is not None else 'N/A'}")
     print(f"REL final count after dedupe: {rel_final.count() if rel_final is not None else 'N/A'}")
+    print(f"API TXN final count after dedupe: {api_txn_final.count() if api_txn_final is not None else 'N/A'}")
+    print(f"API REL final count after dedupe: {api_rel_final.count() if api_rel_final is not None else 'N/A'}")
 
     # REMOVED RECORDS CSV: one file per survey type per event_date, combining
     # campaign-filter removals (IVR only) and dedupe removals (all 3), with a
@@ -609,6 +698,28 @@ for event_date_value in dates_to_process:
                 f"{REMOVED_RECORDS_REL_PATH}event_date={event_date_value}/removed_records.csv",
                 REMOVED_RECORDS_REL_TMP,
                 "REL REMOVED RECORDS"
+            )
+
+        if api_txn_dedup_removed is not None and api_txn_dedup_removed.count() > 0:
+            api_txn_removed_combined = api_txn_dedup_removed \
+                .withColumn("survey_type", F.lit("API_TXN")) \
+                .withColumn("event_date", F.lit(event_date_value))
+            write_removed_records_csv(
+                api_txn_removed_combined,
+                f"{REMOVED_RECORDS_API_TXN_PATH}event_date={event_date_value}/removed_records.csv",
+                REMOVED_RECORDS_API_TXN_TMP,
+                "API TXN REMOVED RECORDS"
+            )
+
+        if api_rel_dedup_removed is not None and api_rel_dedup_removed.count() > 0:
+            api_rel_removed_combined = api_rel_dedup_removed \
+                .withColumn("survey_type", F.lit("API_REL")) \
+                .withColumn("event_date", F.lit(event_date_value))
+            write_removed_records_csv(
+                api_rel_removed_combined,
+                f"{REMOVED_RECORDS_API_REL_PATH}event_date={event_date_value}/removed_records.csv",
+                REMOVED_RECORDS_API_REL_TMP,
+                "API REL REMOVED RECORDS"
             )
     except Exception as e:
         logger.error(f"Failed to write removed-records CSV files for event_date={event_date_value}. Error: {str(e)}")
@@ -705,6 +816,62 @@ for event_date_value in dates_to_process:
             except Exception:
                 pass
             print("REL final written successfully")
+
+        if api_txn_final is not None:
+            api_txn_final_partition = f"{FINAL_API_TXN_PATH}event_date={event_date_value}/"
+            try:
+                api_txn_existing_count = spark.read.parquet(api_txn_final_partition.rstrip("/")).count()
+            except Exception:
+                api_txn_existing_count = 0
+            api_txn_new_count = api_txn_final.count()
+            api_txn_new_records_found = api_txn_new_count > api_txn_existing_count
+            print(f"[NEW RECORDS CHECK] API TXN - Existing in S3 before this run: {api_txn_existing_count} | To be written: {api_txn_new_count} | New records found: {api_txn_new_records_found}")
+
+            #write to staging
+            api_txn_final.write.mode("overwrite").parquet(FINAL_API_TXN_STAGING)
+            #Read back and write to final partition
+            spark.read.parquet(FINAL_API_TXN_STAGING).write.mode("overwrite").parquet(
+                f"{FINAL_API_TXN_PATH}event_date={event_date_value}/"
+            )
+            # Clean up staging
+            try:
+                bucket = FINAL_API_TXN_STAGING.replace("s3://","").split("/")[0]
+                prefix = "/".join(FINAL_API_TXN_STAGING.replace("s3://","").split("/")[1:])
+                objs = s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+                if objs:
+                    keys = [{"key": o["key"]} for o in objs]
+                    s3.delete_objects(Bucket=bucket,Delete={"Objects": keys})
+            except Exception:
+                pass
+            print("API TXN final written successfully")
+
+        if api_rel_final is not None:
+            api_rel_final_partition = f"{FINAL_API_REL_PATH}event_date={event_date_value}/"
+            try:
+                api_rel_existing_count = spark.read.parquet(api_rel_final_partition.rstrip("/")).count()
+            except Exception:
+                api_rel_existing_count = 0
+            api_rel_new_count = api_rel_final.count()
+            api_rel_new_records_found = api_rel_new_count > api_rel_existing_count
+            print(f"[NEW RECORDS CHECK] API REL - Existing in S3 before this run: {api_rel_existing_count} | To be written: {api_rel_new_count} | New records found: {api_rel_new_records_found}")
+
+            #write to staging
+            api_rel_final.write.mode("overwrite").parquet(FINAL_API_REL_STAGING)
+            #Read back and write to final partition
+            spark.read.parquet(FINAL_API_REL_STAGING).write.mode("overwrite").parquet(
+                f"{FINAL_API_REL_PATH}event_date={event_date_value}/"
+            )
+            # Clean up staging
+            try:
+                bucket = FINAL_API_REL_STAGING.replace("s3://","").split("/")[0]
+                prefix = "/".join(FINAL_API_REL_STAGING.replace("s3://","").split("/")[1:])
+                objs = s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+                if objs:
+                    keys = [{"key": o["key"]} for o in objs]
+                    s3.delete_objects(Bucket=bucket,Delete={"Objects": keys})
+            except Exception:
+                pass
+            print("API REL final written successfully")
     except Exception as e:
         logger.error(f"Failed to write final parquet files. Error:{str(e)}")
         raise
@@ -717,6 +884,8 @@ for event_date_value in dates_to_process:
     ivr_ytd = None
     txn_ytd = None
     rel_ytd = None
+    api_txn_ytd = None
+    api_rel_ytd = None
 
     if ivr_final is not None:
         ivr_ytd = ivr_final.filter(
@@ -740,6 +909,26 @@ for event_date_value in dates_to_process:
 
     if rel_final is not None:
         rel_ytd = rel_final.filter(
+            F.col("event_date") == daily_date
+        ).agg(
+            F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
+            F.avg("q3_effort_value").alias("q2_avg_csat"),
+            F.avg("q4_overall_satisfaction").alias("q3_avg_csat")
+        ).withColumn("event_date", daily_date) \
+         .withColumn("processing_date", today)
+
+    if api_txn_final is not None:
+        api_txn_ytd = api_txn_final.filter(
+            F.col("event_date") == daily_date
+        ).agg(
+            F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
+            F.avg("q2_effort_value").alias("q2_avg_csat"),
+            F.avg("q3_overall_satisfaction").alias("q3_avg_csat")
+        ).withColumn("event_date", daily_date) \
+         .withColumn("processing_date", today)
+
+    if api_rel_final is not None:
+        api_rel_ytd = api_rel_final.filter(
             F.col("event_date") == daily_date
         ).agg(
             F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
@@ -776,6 +965,22 @@ for event_date_value in dates_to_process:
                 .parquet(YTD_REL_FILE)
             )
             print("REL YTD written successfully")
+        if api_txn_ytd is not None:
+            (
+                api_txn_ytd.write
+                .mode("append")
+                .partitionBy("event_date")
+                .parquet(YTD_API_TXN_FILE)
+            )
+            print("API TXN YTD written successfully")
+        if api_rel_ytd is not None:
+            (
+                api_rel_ytd.write
+                .mode("append")
+                .partitionBy("event_date")
+                .parquet(YTD_API_REL_FILE)
+            )
+            print("API REL YTD written successfully")
     except Exception as e:
         logger.error(f"Failed to write YTD files. Error: {str(e)}")
         raise
@@ -786,6 +991,10 @@ for event_date_value in dates_to_process:
     txn_out = txn_final.count() if txn_final is not None else "N/A"
     rel_in = rel_raw.count() if rel_raw is not None else "N/A"
     rel_out = rel_final.count() if rel_final is not None else "N/A"
+    api_txn_in = api_txn_raw.count() if api_txn_raw is not None else "N/A"
+    api_txn_out = api_txn_final.count() if api_txn_final is not None else "N/A"
+    api_rel_in = api_rel_raw.count() if api_rel_raw is not None else "N/A"
+    api_rel_out = api_rel_final.count() if api_rel_final is not None else "N/A"
 
     print("=" * 60)
     print(f"[FINAL SUMMARY] event_date: {event_date_value}")
@@ -793,6 +1002,8 @@ for event_date_value in dates_to_process:
     print(f"[FINAL SUMMARY] IVR - Removed by campaign filter (non-Main): {ivr_campaign_removed}")
     print(f"[FINAL SUMMARY] TXN - Input: {txn_in} | Final: {txn_out}")
     print(f"[FINAL SUMMARY] REL - Input: {rel_in} | Final: {rel_out}")
+    print(f"[FINAL SUMMARY] API TXN - Input: {api_txn_in} | Final: {api_txn_out}")
+    print(f"[FINAL SUMMARY] API REL - Input: {api_rel_in} | Final: {api_rel_out}")
     print("=" * 60)
 
     all_dates_processed.append(event_date_value)
@@ -801,6 +1012,8 @@ for event_date_value in dates_to_process:
         "ivr_new_records_found": ivr_new_records_found,
         "sms_web_transactional_new_records_found": txn_new_records_found,
         "sms_web_relational_new_records_found": rel_new_records_found,
+        "api_web_transactional_new_records_found": api_txn_new_records_found,
+        "api_web_relational_new_records_found": api_rel_new_records_found,
     })
 
 # DAILY AGGREGATES (computed once after all dates processed)
@@ -818,6 +1031,8 @@ current_year = date.today().year
 ivr_agg = None
 txn_agg = None
 rel_agg = None
+api_txn_agg = None
+api_rel_agg = None
 
 # Each source is read/aggregated independently -- NOT gated on whether the
 # LAST date_to_process in the loop above happened to have data for that
@@ -867,6 +1082,34 @@ try:
 except Exception as e:
     print(f"[DAILY AGG] REL: no historical data found at {FINAL_REL_PATH} for year {current_year}, skipping. ({str(e)})")
 
+try:
+    api_txn_all_history = spark.read.parquet(FINAL_API_TXN_PATH.rstrip("/")) \
+        .filter(F.year(F.col("event_date")) == current_year)
+    api_txn_agg = api_txn_all_history.agg(
+        F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q2_effort_value").alias("q2_avg_csat"),
+        F.avg("q3_overall_satisfaction").alias("q3_avg_csat"),
+        F.min("event_date").alias("event_start_date"),
+        F.max("event_date").alias("event_end_date")
+    ).withColumn("calculated_date", calculated_date)
+    print(f"[DAILY AGG] API TXN: read {api_txn_all_history.count()} records for year {current_year}, computed cumulative average")
+except Exception as e:
+    print(f"[DAILY AGG] API TXN: no historical data found at {FINAL_API_TXN_PATH} for year {current_year}, skipping. ({str(e)})")
+
+try:
+    api_rel_all_history = spark.read.parquet(FINAL_API_REL_PATH.rstrip("/")) \
+        .filter(F.year(F.col("event_date")) == current_year)
+    api_rel_agg = api_rel_all_history.agg(
+        F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q3_effort_value").alias("q2_avg_csat"),
+        F.avg("q4_overall_satisfaction").alias("q3_avg_csat"),
+        F.min("event_date").alias("event_start_date"),
+        F.max("event_date").alias("event_end_date")
+    ).withColumn("calculated_date", calculated_date)
+    print(f"[DAILY AGG] API REL: read {api_rel_all_history.count()} records for year {current_year}, computed cumulative average")
+except Exception as e:
+    print(f"[DAILY AGG] API REL: no historical data found at {FINAL_API_REL_PATH} for year {current_year}, skipping. ({str(e)})")
+
 # WRITE AGG (one file per survey type, overwrite mode)
 try:
     print("Writing daily aggregate files (overwrite)")
@@ -876,6 +1119,10 @@ try:
         write_single_file(txn_agg, AGG_TXN_FILE, AGG_TXN_TMP, "TXN AGG")
     if rel_agg is not None:
         write_single_file(rel_agg, AGG_REL_FILE, AGG_REL_TMP, "REL AGG")
+    if api_txn_agg is not None:
+        write_single_file(api_txn_agg, AGG_API_TXN_FILE, AGG_API_TXN_TMP, "API TXN AGG")
+    if api_rel_agg is not None:
+        write_single_file(api_rel_agg, AGG_API_REL_FILE, AGG_API_REL_TMP, "API REL AGG")
     print("Daily aggregate files written successfully")
 except Exception as e:
     logger.error(f"Failed to write daily aggregate files. Error: {str(e)}")
@@ -891,6 +1138,8 @@ execution_date_today = date.today().isoformat()
 ivr_available = ivr_final is not None and ivr_final.count() > 0
 txn_available = txn_final is not None and txn_final.count() > 0
 rel_available = rel_final is not None and rel_final.count() > 0
+api_txn_available = api_txn_final is not None and api_txn_final.count() > 0
+api_rel_available = api_rel_final is not None and api_rel_final.count() > 0
 
 try:
     print(f"[TRACKER] Writing tracker record for execution_date={execution_date_today}")
@@ -901,11 +1150,13 @@ try:
             "ivr_available": ivr_available,
             "sms_web_relational_available": rel_available,
             "sms_web_transactional_available": txn_available,
+            "api_web_transactional_available": api_txn_available,
+            "api_web_relational_available": api_rel_available,
             "dates_processed": all_dates_processed,
             "source_new_records": source_new_records_report,
         }
     )
-    print(f"[TRACKER] ivr_available={ivr_available} | sms_web_relational_available={rel_available} | sms_web_transactional_available={txn_available}")
+    print(f"[TRACKER] ivr_available={ivr_available} | sms_web_relational_available={rel_available} | sms_web_transactional_available={txn_available} | api_web_transactional_available={api_txn_available} | api_web_relational_available={api_rel_available}")
     print(f"[TRACKER] dates_processed={all_dates_processed}")
     print(f"[TRACKER] source_new_records={source_new_records_report}")
 except Exception as e:
