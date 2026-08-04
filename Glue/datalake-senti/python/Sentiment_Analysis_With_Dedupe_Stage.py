@@ -330,7 +330,7 @@ def dedupe_txn_rel_specific(df, label: str, comment_cols: List[str]):
 
     # Build a combined removed-records dataframe (all 3 cases, tagged with
     # which case caused removal), for CSV export purposes.
-    removed_cols = [c for c in ["response_received_date", "cas_account_number", "customer_account_number"] if c in df.columns]
+    removed_cols = [c for c in ["response_received_date", "cas_account_number", "customer_account_number", "contact_record_id"] if c in df.columns]
     case1_tagged = case1_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_1"))
     case2_tagged = case2_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_2"))
     case3_tagged = case3_duplicates.select(*removed_cols).withColumn("removal_reason", F.lit("DEDUP_CASE_3"))
@@ -674,7 +674,7 @@ for event_date_value in dates_to_process:
     # given survey type -- IVR's raw schema appears to use
     # customer_account_number rather than cas_account_number).
     try:
-        removed_cols = ["response_received_date", "cas_account_number", "customer_account_number"]
+        removed_cols = ["response_received_date", "cas_account_number", "customer_account_number", "contact_record_id"]
 
         ivr_removed_parts = []
         if ivr_campaign_removed_df is not None and ivr_campaign_removed_df.count() > 0:
@@ -693,7 +693,7 @@ for event_date_value in dates_to_process:
                 ivr_removed_combined = ivr_removed_combined.unionByName(part)
             ivr_removed_combined = ivr_removed_combined \
                 .withColumn("survey_type", F.lit("IVR")) \
-                .withColumn("event_date", F.lit(event_date_value))
+                .withColumn("removed_date", F.lit(event_date_value))
             write_removed_records_csv(
                 ivr_removed_combined,
                 f"{REMOVED_RECORDS_IVR_PATH}event_date={event_date_value}/removed_records.csv",
@@ -704,7 +704,7 @@ for event_date_value in dates_to_process:
         if txn_dedup_removed is not None and txn_dedup_removed.count() > 0:
             txn_removed_combined = txn_dedup_removed \
                 .withColumn("survey_type", F.lit("TXN")) \
-                .withColumn("event_date", F.lit(event_date_value))
+                .withColumn("removed_date", F.lit(event_date_value))
             write_removed_records_csv(
                 txn_removed_combined,
                 f"{REMOVED_RECORDS_TXN_PATH}event_date={event_date_value}/removed_records.csv",
@@ -715,7 +715,7 @@ for event_date_value in dates_to_process:
         if rel_dedup_removed is not None and rel_dedup_removed.count() > 0:
             rel_removed_combined = rel_dedup_removed \
                 .withColumn("survey_type", F.lit("REL")) \
-                .withColumn("event_date", F.lit(event_date_value))
+                .withColumn("removed_date", F.lit(event_date_value))
             write_removed_records_csv(
                 rel_removed_combined,
                 f"{REMOVED_RECORDS_REL_PATH}event_date={event_date_value}/removed_records.csv",
@@ -726,7 +726,7 @@ for event_date_value in dates_to_process:
         if api_txn_dedup_removed is not None and api_txn_dedup_removed.count() > 0:
             api_txn_removed_combined = api_txn_dedup_removed \
                 .withColumn("survey_type", F.lit("API_TXN")) \
-                .withColumn("event_date", F.lit(event_date_value))
+                .withColumn("removed_date", F.lit(event_date_value))
             write_removed_records_csv(
                 api_txn_removed_combined,
                 f"{REMOVED_RECORDS_API_TXN_PATH}event_date={event_date_value}/removed_records.csv",
@@ -737,7 +737,7 @@ for event_date_value in dates_to_process:
         if api_rel_dedup_removed is not None and api_rel_dedup_removed.count() > 0:
             api_rel_removed_combined = api_rel_dedup_removed \
                 .withColumn("survey_type", F.lit("API_REL")) \
-                .withColumn("event_date", F.lit(event_date_value))
+                .withColumn("removed_date", F.lit(event_date_value))
             write_removed_records_csv(
                 api_rel_removed_combined,
                 f"{REMOVED_RECORDS_API_REL_PATH}event_date={event_date_value}/removed_records.csv",
