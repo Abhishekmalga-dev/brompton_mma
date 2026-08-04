@@ -342,39 +342,39 @@ def normalize_ivr(df):
     return df.withColumn("q1_csat_with_ivr", F.col("q1_csat_with_ivr_value").cast(DoubleType())) \
         .withColumn("q2_ease_with_ivr", F.col("q2_ease_with_ivr_value").cast(DoubleType())) \
         .withColumn("q3_csat_with_pseg_li", F.col("q3_csat_with_pseg_li_value").cast(DoubleType())) \
-        .withColumn("q1_question_text", F.lit("How would you rate your overall satisfaction with this transaction")) \
-        .withColumn("q2_question_text", F.lit("How would you rate the ease of your transaction")) \
-        .withColumn("q3_question_text", F.lit("How would you rate your overall satisfaction")) \
-        .withColumn("q4_question_text", F.lit("Was this the first time you called to resolve this issue")) \
-        .withColumn("q5_question_text", F.lit("Do you have additional feedback on how could we improve your overall experience with PSEG Long Island"))
+        .withColumn("how_would_you_rate_your_overall_satisfaction_with_this_transaction", F.col("q1_csat_with_ivr_value").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_the_ease_of_your_transaction", F.col("q2_ease_with_ivr_value").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_overall_satisfaction", F.col("q3_csat_with_pseg_li_value").cast(DoubleType())) \
+        .withColumn("was_this_the_first_time_you_called_to_resolve_this_issue", F.col("q4_first_call_resolution")) \
+        .withColumn("do_you_have_additional_feedback_on_how_could_we_improve_your_overall_experience_with_pseg_long_island", F.col("q5_overall_exp_comment"))
 
 def normalize_txn(df):
     return df.withColumn("q1_satisfaction_value", F.col("q1_satisfaction_value_sms").cast(DoubleType())) \
         .withColumn("q2_effort_value", F.col("q2_effort_value_sms").cast(DoubleType())) \
         .withColumn("q3_overall_satisfaction", F.col("q3_overall_satisfaction_value_sms").cast(DoubleType())) \
-        .withColumn("q1_question_text", F.lit("How would you rate your overall satisfaction with this transaction")) \
-        .withColumn("q2_question_text", F.lit("How would you rate your satisfaction with the level of effort required to complete your transaction during this visit")) \
-        .withColumn("q3_question_text", F.lit("How would you rate your overall satisfaction with the service you receive from PSEG Long LI")) \
-        .withColumn("q4_question_text", F.lit("Do you have additional feedback regarding your transaction this visit"))
+        .withColumn("how_would_you_rate_your_overall_satisfaction_with_this_transaction", F.col("q1_satisfaction_value_sms").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_satisfaction_with_the_level_of_effort_required_to_complete_your_transaction_during_this_visit", F.col("q2_effort_value_sms").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_overall_satisfaction_with_the_service_you_receive_from_pseg_long_li", F.col("q3_overall_satisfaction_value_sms").cast(DoubleType())) \
+        .withColumn("do_you_have_additional_feedback_regarding_your_transaction_this_visit", F.col("q4_comment_sms"))
 
 def normalize_rel(df):
     return df.withColumn("q2_satisfaction_value", F.col("q2_satisfaction_value_sms").cast(DoubleType())) \
         .withColumn("q3_effort_value", F.col("q3_effort_value_sms").cast(DoubleType())) \
         .withColumn("q4_overall_satisfaction", F.col("q4_overall_satisfaction_value_sms").cast(DoubleType())) \
-        .withColumn("q1_question_text", F.lit("Enter the reasons for this Myaccount visit")) \
-        .withColumn("q2_question_text", F.lit("How would you rate your overall satisfaction with this transaction")) \
-        .withColumn("q3_question_text", F.lit("How would you rate your satisfaction with the level of effort required to complete your transaction during this visit")) \
-        .withColumn("q4_question_text", F.lit("How would you rate your overall satisfaction overall with PSEGLI")) \
-        .withColumn("q5_question_text", F.lit("Please provide the reason for the satisfaction score you just gave"))
+        .withColumn("enter_the_reasons_for_this_myaccount_visit", F.col("q1_reasons_sms")) \
+        .withColumn("how_would_you_rate_your_overall_satisfaction_with_this_transaction", F.col("q2_satisfaction_value_sms").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_satisfaction_with_the_level_of_effort_required_to_complete_your_transaction_during_this_visit", F.col("q3_effort_value_sms").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_overall_satisfaction_overall_with_psegli", F.col("q4_overall_satisfaction_value_sms").cast(DoubleType())) \
+        .withColumn("please_provide_the_reason_for_the_satisfaction_score_you_just_gave", F.col("q5_comment_sms"))
 
 def normalize_api_txn(df):
     return df.withColumn("q1_satisfaction_value", F.col("q1_satisfaction_value").cast(DoubleType())) \
         .withColumn("q2_effort_value", F.col("q2_effort_value").cast(DoubleType())) \
         .withColumn("q3_overall_satisfaction", F.col("q3_overall_satisfaction_value").cast(DoubleType())) \
-        .withColumn("q1_question_text", F.lit("How would you rate your overall satisfaction with this visit")) \
-        .withColumn("q2_question_text", F.lit("How would you rate your satisfaction with the level of effort required to complete your transaction during this visit")) \
-        .withColumn("q3_question_text", F.lit("How would you rate your overall satisfaction with the service you receive from PSEG Long Island")) \
-        .withColumn("q4_question_text", F.lit("Do you have additional feedback regarding your transaction for this visit"))
+        .withColumn("how_would_you_rate_your_overall_satisfaction_with_this_visit", F.col("q1_satisfaction_value").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_satisfaction_with_the_level_of_effort_required_to_complete_your_transaction_during_this_visit", F.col("q2_effort_value").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_overall_satisfaction_with_the_service_you_receive_from_pseg_long_island", F.col("q3_overall_satisfaction_value").cast(DoubleType())) \
+        .withColumn("do_you_have_additional_feedback_regarding_your_transaction_for_this_visit", F.col("q4_feedback_comment"))
 
 def normalize_api_rel(df):
     # web_relational_survey_q2_satisfaction holds values like "5 - Very Satisfied" --
@@ -385,11 +385,14 @@ def normalize_api_rel(df):
         ) \
         .withColumn("q3_effort_value", F.col("q3_effort_value").cast(DoubleType())) \
         .withColumn("q4_overall_satisfaction", F.col("q4_overall_satisfaction_value").cast(DoubleType())) \
-        .withColumn("q1_question_text", F.lit("Enter the reasons for this MyAccount visit")) \
-        .withColumn("q2_question_text", F.lit("How would you rate your overall satisfaction with this transaction")) \
-        .withColumn("q3_question_text", F.lit("How would you rate your satisfaction with the level of effort required to complete your transaction during this visit")) \
-        .withColumn("q4_question_text", F.lit("How would you rate your overall satisfaction overall with PSEGLI")) \
-        .withColumn("q5_question_text", F.lit("Please provide the reason for the satisfaction score you just gave"))
+        .withColumn("enter_the_reasons_for_this_myaccount_visit", F.col("q1_reasons_in_survey_language")) \
+        .withColumn(
+            "how_would_you_rate_your_overall_satisfaction_with_this_transaction",
+            F.col("q2_satisfaction_value")
+        ) \
+        .withColumn("how_would_you_rate_your_satisfaction_with_the_level_of_effort_required_to_complete_your_transaction_during_this_visit", F.col("q3_effort_value").cast(DoubleType())) \
+        .withColumn("how_would_you_rate_your_overall_satisfaction_overall_with_psegli", F.col("q4_overall_satisfaction_value").cast(DoubleType())) \
+        .withColumn("please_provide_the_reason_for_the_satisfaction_score_you_just_gave", F.col("q5_feedback_comment"))
 
 def apply_intent(df, intent_map_df):
     print("Applying intent mapping")
