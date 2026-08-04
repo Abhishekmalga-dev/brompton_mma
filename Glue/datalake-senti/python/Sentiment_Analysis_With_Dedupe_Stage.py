@@ -129,17 +129,17 @@ AGG_API_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysi
 
 # Removed-records CSV output (campaign filter + dedupe), one file per
 # survey type per event_date.
-REMOVED_RECORDS_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/ivr")
-REMOVED_RECORDS_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/sms_transactional")
-REMOVED_RECORDS_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/sms_relational")
-REMOVED_RECORDS_API_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/api_transactional")
-REMOVED_RECORDS_API_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/api_relational")
+REMOVED_RECORDS_IVR_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/ivr_quarantine")
+REMOVED_RECORDS_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/sms_transactional_quarantine")
+REMOVED_RECORDS_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/sms_relational_quarantine")
+REMOVED_RECORDS_API_TXN_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/api_transactional_quarantine")
+REMOVED_RECORDS_API_REL_PATH = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/api_relational_quarantine")
 
-REMOVED_RECORDS_IVR_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_ivr")
-REMOVED_RECORDS_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_sms_transactional")
-REMOVED_RECORDS_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_sms_relational")
-REMOVED_RECORDS_API_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_api_transactional")
-REMOVED_RECORDS_API_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_api_relational")
+REMOVED_RECORDS_IVR_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_ivr_quarantine")
+REMOVED_RECORDS_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_sms_transactional_quarantine")
+REMOVED_RECORDS_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_sms_relational_quarantine")
+REMOVED_RECORDS_API_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_api_transactional_quarantine")
+REMOVED_RECORDS_API_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/removed_records/tmp_api_relational_quarantine")
 
 # HELPERS
 
@@ -769,7 +769,7 @@ for event_date_value in dates_to_process:
             print(f"[NEW RECORDS CHECK] IVR - Existing in S3 before this run: {ivr_existing_count} | To be written: {ivr_new_count} | New records found: {ivr_new_records_found}")
 
             #write to staging
-            ivr_final.write.mode("overwrite").parquet(FINAL_IVR_STAGING)
+            ivr_final.drop("event_date").write.mode("overwrite").parquet(FINAL_IVR_STAGING)
             #Read back and write to final partition
             spark.read.parquet(FINAL_IVR_STAGING).write.mode("overwrite").parquet(
                 f"{FINAL_IVR_PATH}event_date={event_date_value}/"
@@ -798,7 +798,7 @@ for event_date_value in dates_to_process:
             print(f"[NEW RECORDS CHECK] TXN - Existing in S3 before this run: {txn_existing_count} | To be written: {txn_new_count} | New records found: {txn_new_records_found}")
 
             #write to staging
-            txn_final.write.mode("overwrite").parquet(FINAL_TXN_STAGING)
+            txn_final.drop("event_date").write.mode("overwrite").parquet(FINAL_TXN_STAGING)
             #Read back and write to final partition
             spark.read.parquet(FINAL_TXN_STAGING).write.mode("overwrite").parquet(
                 f"{FINAL_TXN_PATH}event_date={event_date_value}/"
@@ -826,7 +826,7 @@ for event_date_value in dates_to_process:
             print(f"[NEW RECORDS CHECK] REL - Existing in S3 before this run: {rel_existing_count} | To be written: {rel_new_count} | New records found: {rel_new_records_found}")
 
             #write to staging
-            rel_final.write.mode("overwrite").parquet(FINAL_REL_STAGING)
+            rel_final.drop("event_date").write.mode("overwrite").parquet(FINAL_REL_STAGING)
             #Read back and write to final partition
             spark.read.parquet(FINAL_REL_STAGING).write.mode("overwrite").parquet(
                 f"{FINAL_REL_PATH}event_date={event_date_value}/"
@@ -854,7 +854,7 @@ for event_date_value in dates_to_process:
             print(f"[NEW RECORDS CHECK] API TXN - Existing in S3 before this run: {api_txn_existing_count} | To be written: {api_txn_new_count} | New records found: {api_txn_new_records_found}")
 
             #write to staging
-            api_txn_final.write.mode("overwrite").parquet(FINAL_API_TXN_STAGING)
+            api_txn_final.drop("event_date").write.mode("overwrite").parquet(FINAL_API_TXN_STAGING)
             #Read back and write to final partition
             spark.read.parquet(FINAL_API_TXN_STAGING).write.mode("overwrite").parquet(
                 f"{FINAL_API_TXN_PATH}event_date={event_date_value}/"
@@ -882,7 +882,7 @@ for event_date_value in dates_to_process:
             print(f"[NEW RECORDS CHECK] API REL - Existing in S3 before this run: {api_rel_existing_count} | To be written: {api_rel_new_count} | New records found: {api_rel_new_records_found}")
 
             #write to staging
-            api_rel_final.write.mode("overwrite").parquet(FINAL_API_REL_STAGING)
+            api_rel_final.drop("event_date").write.mode("overwrite").parquet(FINAL_API_REL_STAGING)
             #Read back and write to final partition
             spark.read.parquet(FINAL_API_REL_STAGING).write.mode("overwrite").parquet(
                 f"{FINAL_API_REL_PATH}event_date={event_date_value}/"
