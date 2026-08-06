@@ -1,18 +1,17 @@
-Subject: Assistance Needed: Network Error During File Upload from NICE — AWS Debugging Support
+Subject: Query: Trailing 'Thank You' Text in Intent Column for SMS/Web Pop-Up Survey Data
 
 Hi Team,
 
-I wanted to flag an ongoing network issue that we have been experiencing over the past week.
+We have been validating the latest SMS/Web pop-up survey data and have identified an issue with the Intent column.
 
-We receive CSV export files daily from our vendor, NICE, and when we attempt to upload these files, we are encountering a network error. This has been happening consistently since last week and is impacting our data pipeline.
-
-At this point, the error message only indicates that it is a network error and does not provide further details on the root cause. This is making it difficult for us to debug the issue from our end, and our vendor NICE is also unable to determine the exact cause without more detailed error information.
+We are observing that several values in the Intent column contain trailing text such as '-thankyou' and 'thankyou' appended after the actual intent value. This does not appear to be intentional and is impacting the quality of the data we are receiving. For reference, the IVR survey data does not have this issue and provides clean intent values without any such trailing text.
 
 Could you please help us with the following:
-1. Is there a way to get more detailed error logs or diagnostics from AWS to help identify the exact cause of the network failure during the file upload?
-2. Could you help route us to the right point of contact at AWS Support to assist with debugging this issue?
+1. Could you clarify why these trailing values ('-thankyou' / 'thankyou') are being appended to the Intent column for the SMS/Web pop-up survey data?
+2. Could you provide an updated file with the corrected Intent values so we can reprocess the data on our end?
+3. Additionally, could you apply a fix on your end within the Feedback Manager so that we start receiving clean intent values going forward, consistent with what we receive for IVR data?
 
-Any help in getting more clarity on this error would be greatly appreciated, as it is currently causing data gaps in our pipeline.
+Having clean and consistent data across all survey channels is important for our downstream processing and analytics. Please let us know if you need any sample records from our end to assist with the investigation.
 
 Thank you,
 Abhishek
