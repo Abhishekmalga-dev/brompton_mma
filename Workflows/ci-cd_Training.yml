@@ -1,0 +1,146 @@
+name: Deploy Comprehend Training Infrastructure
+
+# Separate file from ci-cd-sentiment-analysis.yml BY DESIGN -
+# so the training/eval pipeline can be modified and redeployed independently of the
+# daily-use pipeline. Same DeployEnv/workflow_dispatch pattern as the sentiment
+# analysis workflow, for consistency.
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      # Only trigger on changes actually relevant to this stack, so a daily-pipeline
+      # change doesn't force a training redeploy and vice versa.
+      - "source/pipeline/lambda-functions/datalake-comprehend-train-*/**"
+      - "source/pipeline/lambda-functions/datalake-comprehend-update-train-data/**"
+      - "source/pipeline/step-functions/datalake-comprehend-training-temp.json"
+      - "source/cloudformation/comprehend_training_stack.yml"
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: "Environment to deploy (overrides branch-based default - required for staging)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64, datalake]
+
+    env:
+      AWS_REGION: us-east-1
+
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_env || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set environment variables based on trigger
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "DEPLOY_ENV=${{ inputs.deploy_env }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "DEPLOY_ENV=prod" >> $GITHUB_ENV
+          else
+            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+          fi
+
+          echo "CODEVERSION=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
+
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "GITHUB_EVENT_NAME=${{ github.event_name }}"
+
+      - name: Resolve script/artifact env token
+        run: |
+          # Same sharing logic as the daily pipeline: dev and staging deploys
+          # share the same compiled zip artifacts (same nonprod tier, same code).
+          if [ "${DEPLOY_ENV}" == "prod" ]; then
+            echo "ARTIFACT_ENV_TOKEN=prod" >> $GITHUB_ENV
+          else
+            echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+          fi
+
+      - name: Build and upload Lambda artifacts
+        run: |
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+          ARTIFACT_PREFIX="training-artifact"
+          LAMBDA_BASE="source/pipeline/lambda-functions"
+
+          # 11 training-pipeline Lambda functions - cross-checked 1:1 against the
+          # CloudFormation template's 11 AWS::Lambda::Function resources.
+          LAMBDAS=(
+            "datalake-comprehend-train-actionable"
+            "datalake-comprehend-train-final-output"
+            "datalake-comprehend-train-gate"
+            "datalake-comprehend-train-level2"
+            "datalake-comprehend-train-level3"
+            "datalake-comprehend-train-level3-classifier"
+            "datalake-comprehend-train-level4"
+            "datalake-comprehend-train-update-baseline"
+            "datalake-comprehend-train-urgent"
+            "datalake-comprehend-train-validate-output"
+            "datalake-comprehend-update-train-data"
+          )
+
+          for name in "${LAMBDAS[@]}"; do
+            SRC_DIR="${LAMBDA_BASE}/${name}/python"
+            if [ -f "${SRC_DIR}/${name}.py" ]; then
+              mkdir -p "build/${name}/python"
+              cp "${SRC_DIR}/${name}.py" "build/${name}/python/"
+              (cd "build/${name}" && zip -r "../../${name}.zip" python)
+              aws s3 cp "${name}.zip" \
+                "s3://${ARTIFACT_BUCKET}/${ARTIFACT_PREFIX}/${name}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.zip" \
+                --no-verify-ssl
+            else
+              echo "WARNING: ${SRC_DIR}/${name}.py not found - skipping ${name}"
+            fi
+          done
+
+      - name: Validate CloudFormation template
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/comprehend_training_stack.yml"
+          aws cloudformation validate-template --template-body file://"$TEMPLATE"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/comprehend_training_stack.yml"
+          STACK_NAME="datalake-comprehend-training-infra-${DEPLOY_ENV}"
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+
+          # No --capabilities flag needed: this template creates zero IAM resources.
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+              DeployEnv=${DEPLOY_ENV} \
+              ArtifactBucket=${ARTIFACT_BUCKET} \
+              CodeVersion=${CODEVERSION}
+
+      - name: Print CloudFormation Events on Failure
+        if: always()
+        run: |
+          aws cloudformation describe-stack-events \
+            --stack-name "datalake-comprehend-training-infra-${DEPLOY_ENV}" \
+            --query 'StackEvents[?ResourceStatus==`FAILED`]' \
+            --max-items 50

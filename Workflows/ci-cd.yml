@@ -1,10 +1,8 @@
 name: Deploy Sentiment Analysis Infrastructure
 
-# NOTE on triggers - flagged design decision, please confirm:
-# The old ccaas ci-cd.yml derived environment purely from git branch (main=prod,
-# else=dev), which worked when there were only two environments tied to two
-# branches. Our new template has three DeployEnv values, and "staging" is NOT a
-# separate git branch (confirmed: dev IS staging, conceptually - staging is an
+# NOTE on triggers - flagged design decision:
+# Our new template has three DeployEnv values, and "staging" is NOT a
+# separate git branch (dev IS staging, conceptually - staging is an
 # on-demand parallel CloudFormation stack in the same nonprod account, not a
 # continuously-deployed branch). So:
 #   - push to "dev" branch  -> auto-deploy DeployEnv=dev  (unchanged behavior)
