@@ -104,7 +104,7 @@ Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Mappings:
-  # NOTE on ResourceSuffix (org naming rule, confirmed 2026-07-23):
+  # NOTE on ResourceSuffix:
   # Every resource this template creates must have a name ending in "-dev"
   # (nonprod tier) or "-prod" (prod tier) - resources not following this
   # convention will not be created / will be rejected. Because "staging" is
@@ -133,8 +133,7 @@ Mappings:
 Resources:
 
   # --- SNS: failure alerting for the sentiment analysis pipeline ---
-  # Replicated per environment (dev / staging / prod each get their own topic),
-  # per confirmed decision: dev already has a live topic + confirmed email
+  # Replicated per environment (dev / staging / prod each get their own topic)
   # subscription (datalake-sentiment-analysis-alerts-dev) that this template
   # will now formally manage going forward, and staging/prod get their own
   # independent copies when deployed.
