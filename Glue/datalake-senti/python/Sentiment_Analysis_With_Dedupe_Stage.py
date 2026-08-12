@@ -428,25 +428,39 @@ def normalize_api_rel(df):
         .withColumn("how_would_you_rate_your_overall_satisfaction_overall_with_psegli", F.col("q4_overall_satisfaction_value").cast(DoubleType())) \
         .withColumn("please_provide_the_reason_for_the_satisfaction_score_you_just_gave", F.col("q5_feedback_comment"))
 
-def apply_intent(df, intent_map_df):
-    print("Applying intent mapping")
+def apply_intent(df, intent_map_df, label):
+    print(f"Applying intent mapping for {label}")
+
+    # Collapse internal whitespace (not just trim edges) before matching,
+    # so e.g. "Payment  History" (double space) matches "Payment History".
     intent_map_clean = (
         intent_map_df
-        .withColumn("old_intent_clean", lower(trim(F.col("old_intent"))))
+        .withColumn("old_intent_clean", F.regexp_replace(lower(trim(F.col("old_intent"))), r"\s+", " "))
         .withColumn("new_intent_clean", lower(trim(F.col("new_intent"))))
         .dropDuplicates(["old_intent_clean"])
     )
 
     df_clean = df.withColumn(
         "intent_clean",
-        lower(trim(F.col("intent")))
+        F.regexp_replace(lower(trim(F.col("intent"))), r"\s+", " ")
     )
 
-    return df_clean.join(
+    joined = df_clean.join(
         broadcast(intent_map_clean),
         df_clean["intent_clean"] == intent_map_clean["old_intent_clean"],
         "left"
-    ).withColumn(
+    )
+
+    # Match-rate logging: a failed match is otherwise silent (falls back to
+    # the original unmapped intent via coalesce below), so surface coverage
+    # here rather than only finding out by inspecting the data later.
+    total_count = joined.count()
+    matched_count = joined.filter(F.col("new_intent_clean").isNotNull()).count()
+    unmatched_count = total_count - matched_count
+    match_rate = (matched_count / total_count * 100) if total_count > 0 else 0.0
+    print(f"[INTENT MAPPING] {label}: {matched_count}/{total_count} rows matched ({match_rate:.1f}%), {unmatched_count} unmapped")
+
+    return joined.withColumn(
         "intent",
         F.coalesce(F.col("new_intent_clean"), F.col("intent"))
     ).drop(
@@ -643,7 +657,7 @@ for event_date_value in dates_to_process:
 
     if ivr_raw is not None:
         ivr_final = normalize_ivr(ivr_raw)
-        ivr_final = apply_intent(ivr_final, intent_map_df)
+        ivr_final = apply_intent(ivr_final, intent_map_df, "IVR")
         ivr_final = ensure_event_date(ivr_final, event_date_value)
         #ivr_final = dedupe_ivr_specific(ivr_final)
         print(f"[PROCESSED COUNT] IVR records after normalize+intent+dedup: {ivr_final.count()}")
@@ -651,7 +665,7 @@ for event_date_value in dates_to_process:
         logger.info("IVR not available. Skipping IVR processing")
     if txn_raw is not None:
         txn_final = normalize_txn(txn_raw)
-        txn_final = apply_intent(txn_final, intent_map_df)
+        txn_final = apply_intent(txn_final, intent_map_df, "TXN")
         txn_final = ensure_event_date(txn_final, event_date_value)
         print(f"[PROCESSED COUNT] TXN records after normalize+intent+dedup: {txn_final.count()}")
     else:
@@ -659,7 +673,7 @@ for event_date_value in dates_to_process:
 
     if rel_raw is not None:
         rel_final = normalize_rel(rel_raw)
-        rel_final = apply_intent(rel_final, intent_map_df)
+        rel_final = apply_intent(rel_final, intent_map_df, "REL")
         rel_final = ensure_event_date(rel_final, event_date_value)
         print(f"[PROCESSED COUNT] REL records after normalize+intent+dedup: {rel_final.count()}")
     else:
@@ -667,7 +681,7 @@ for event_date_value in dates_to_process:
 
     if api_txn_raw is not None:
         api_txn_final = normalize_api_txn(api_txn_raw)
-        api_txn_final = apply_intent(api_txn_final, intent_map_df)
+        api_txn_final = apply_intent(api_txn_final, intent_map_df, "API TXN")
         api_txn_final = ensure_event_date(api_txn_final, event_date_value)
         print(f"[PROCESSED COUNT] API TXN records after normalize+intent+dedup: {api_txn_final.count()}")
     else:
@@ -675,7 +689,7 @@ for event_date_value in dates_to_process:
 
     if api_rel_raw is not None:
         api_rel_final = normalize_api_rel(api_rel_raw)
-        api_rel_final = apply_intent(api_rel_final, intent_map_df)
+        api_rel_final = apply_intent(api_rel_final, intent_map_df, "API REL")
         api_rel_final = ensure_event_date(api_rel_final, event_date_value)
         print(f"[PROCESSED COUNT] API REL records after normalize+intent+dedup: {api_rel_final.count()}")
     else:
