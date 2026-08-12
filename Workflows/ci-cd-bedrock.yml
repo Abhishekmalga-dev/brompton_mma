@@ -1,0 +1,130 @@
+name: Deploy Bedrock Pipeline Infrastructure
+
+# Mirrors ci-cd-sentiment-analysis.yml's trigger/environment logic exactly -
+# same DeployEnv resolution (dev/staging/prod), same reasoning for why staging
+# can only be reached via workflow_dispatch. No pipeline-specific deviation
+# needed here; this is a separate stack purely so it can be deployed/rolled
+# back independently of the daily sentiment pipeline.
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: "Environment to deploy (overrides branch-based default - required for staging)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64, datalake]
+
+    env:
+      AWS_REGION: us-east-1
+
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_env || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set environment variables based on trigger
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "DEPLOY_ENV=${{ inputs.deploy_env }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "DEPLOY_ENV=prod" >> $GITHUB_ENV
+          else
+            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+          fi
+
+          echo "CODEVERSION=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Resolve script/artifact env token
+        run: |
+          # Same logic as ci-cd-sentiment-analysis.yml: dev and staging deploys
+          # share the same compiled artifacts (same nonprod tier, same code).
+          if [ "${DEPLOY_ENV}" == "prod" ]; then
+            echo "ARTIFACT_ENV_TOKEN=prod" >> $GITHUB_ENV
+          else
+            echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+          fi
+
+      - name: Build and upload Lambda artifacts
+        run: |
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+          ARTIFACT_PREFIX="bedrock-artifact"
+          LAMBDA_BASE="source/pipeline/lambda-functions"
+
+          # 3 new Lambdas for this pipeline. NOTE: datalake-comprehend-corrected-output
+          # is intentionally NOT in this list - it's reused from the sentiment
+          # analysis stack via hardcoded ARN, not redeployed here.
+          LAMBDAS=(
+            "datalake-bedrock-prep"
+            "datalake-bedrock-invoke"
+            "datalake-bedrock-merge"
+          )
+
+          for name in "${LAMBDAS[@]}"; do
+            SRC_DIR="${LAMBDA_BASE}/${name}/python"
+            if [ -f "${SRC_DIR}/${name}.py" ]; then
+              mkdir -p "build/${name}/python"
+              cp "${SRC_DIR}/${name}.py" "build/${name}/python/"
+              (cd "build/${name}" && zip -r "../../${name}.zip" python)
+              aws s3 cp "${name}.zip" \
+                "s3://${ARTIFACT_BUCKET}/${ARTIFACT_PREFIX}/${name}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.zip" \
+                --no-verify-ssl
+            else
+              echo "WARNING: ${SRC_DIR}/${name}.py not found - skipping ${name}"
+            fi
+          done
+
+      - name: Validate CloudFormation template
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/bedrock_pipeline_stack.yml"
+          aws cloudformation validate-template --template-body file://"$TEMPLATE"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/bedrock_pipeline_stack.yml"
+          STACK_NAME="datalake-bedrock-pipeline-infra-${DEPLOY_ENV}"
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+
+          # No --capabilities flag needed: this template creates zero IAM
+          # resources - all roles are referenced by name only, same as
+          # sentiment_analysis_stack.yml.
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+              DeployEnv=${DEPLOY_ENV} \
+              ArtifactBucket=${ARTIFACT_BUCKET} \
+              CodeVersion=${CODEVERSION}
+
+      - name: Print CloudFormation Events on Failure
+        if: always()
+        run: |
+          aws cloudformation describe-stack-events \
+            --stack-name "datalake-bedrock-pipeline-infra-${DEPLOY_ENV}" \
+            --query 'StackEvents[?ResourceStatus==`FAILED`]' \
+            --max-items 50

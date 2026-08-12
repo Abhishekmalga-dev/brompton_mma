@@ -17,7 +17,7 @@ Parameters:
       - staging
       - prod
 
-  # --- Existing S3 buckets (NOT created by this template - see Ground Rule 2) ---
+  # --- Existing S3 buckets ---
 
   ArtifactBucket:
     Type: String
@@ -44,8 +44,7 @@ Parameters:
       doesn't follow the same naming pattern as the other three bucket parameters.
     Default: s3://psegli-datalakenonprodli-datalake-build-nonprod/datalake-nonprod-Glue_Temp/
 
-  # --- Existing shared IAM roles (NOT created by this template - see Ground Rule 1) ---
-  # NOTE: confirmed with lead - these three roles stay pinned to their "-dev" suffix
+  # --- Existing shared IAM roles ---
   # regardless of DeployEnv. A "staging" deploy still executes under the "-dev" roles.
   # There is no "-staging" variant of these roles today.
 
@@ -69,11 +68,11 @@ Parameters:
     Description: "Existing shared IAM role name allowing EventBridge rules to start Step Functions executions. Intentionally NOT parameterized by DeployEnv."
     Default: EventBridgeServiceToStepFunctionsRole-datalake-dev
 
-  # --- Cross-service role that structurally requires manual creation (Ground Rule 1) ---
+  # --- Cross-service role that structurally requires manual creation  ---
   # This is NOT one of our three reusable shared roles. Comprehend needs a role it can
   # assume for cross-service data access (S3 read for training/inference data). This
   # must be created manually outside this template if it does not already exist for
-  # the target environment - flagging per Ground Rule 1 rather than creating it inline.
+
 
   ComprehendDataAccessRoleArn:
     Type: String
@@ -105,7 +104,7 @@ Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Mappings:
-  # NOTE on ResourceSuffix (org naming rule, confirmed 2026-07-23):
+  # NOTE on ResourceSuffix:
   # Every resource this template creates must have a name ending in "-dev"
   # (nonprod tier) or "-prod" (prod tier) - resources not following this
   # convention will not be created / will be rejected. Because "staging" is
@@ -116,7 +115,7 @@ Mappings:
   #   staging:  datalake-<resource>-staging-dev
   #   prod:     datalake-<resource>-prod
   # This is distinct from StagingArg, which drives the Glue job's internal
-  # "--STAGING" argument (S3 data-path segmentation), per the original spec.
+  # "--STAGING" argument (S3 data-path segmentation).
   EnvConfig:
     dev:
       AccountTier: nonprod
@@ -134,8 +133,7 @@ Mappings:
 Resources:
 
   # --- SNS: failure alerting for the sentiment analysis pipeline ---
-  # Replicated per environment (dev / staging / prod each get their own topic),
-  # per confirmed decision: dev already has a live topic + confirmed email
+  # Replicated per environment (dev / staging / prod each get their own topic)
   # subscription (datalake-sentiment-analysis-alerts-dev) that this template
   # will now formally manage going forward, and staging/prod get their own
   # independent copies when deployed.
@@ -162,7 +160,7 @@ Resources:
   # to be uploaded as versioned artifacts to be reproducible/rollback-able -
   # so ScriptLocation below follows the same "{name}_{CodeVersion}_{EnvToken}.py"
   # convention already used by the ccaas pipeline's CI/CD. EnvToken here is
-  # "dev"/"prod" (via IsProd), NOT the staging-aware ResourceSuffix - CONFIRMED:
+  # "dev"/"prod" (via IsProd), NOT the staging-aware ResourceSuffix 
   # dev and staging share the same compiled script artifact (same nonprod
   # tier, same code); only the job's *name* and *runtime arguments* (--STAGING)
   # differ between dev and staging, not the underlying script file.
@@ -258,11 +256,10 @@ Resources:
         use-case: sentiment-analysis
 
   # --- DynamoDB: availability-tracking table read by datalake-sentiment-analysis-get-availability ---
-  # Replicated per environment (Option 2, per confirmed decision). Schema confirmed
+  # Replicated per environment. Schema confirmed
   # via console: partition key execution_date (String), no sort key, on-demand
   # billing, no GSIs, PITR off. The Lambda now reads this table's name from the
-  # TRACKER_TABLE_NAME environment variable (code updated to remove the previous
-  # hardcoded "datalake-sentiment-analysis-tracker-dev" literal).
+  # TRACKER_TABLE_NAME environment variable.
 
   SentimentAnalysisTrackerTable:
     Type: AWS::DynamoDB::Table
@@ -278,10 +275,8 @@ Resources:
         - AttributeName: execution_date
           KeyType: HASH
   # --- Lambda Functions (13 total) ---
-  # Shared settings (Runtime/Timeout/MemorySize/EphemeralStorage) confirmed via
-  # console screenshot of an existing function's Configuration tab. Handler
-  # convention (python.<filename>.lambda_handler) confirmed via repo folder
-  # structure - every function's zip contains a python/ subfolder.
+  # Shared settings (Runtime/Timeout/MemorySize/EphemeralStorage). Handler
+  # convention (python.<filename>.lambda_handler).
 
   ComprehendActionableLambda:
     Type: AWS::Lambda::Function
@@ -697,7 +692,10 @@ Resources:
               "GeneratePipelineConfig": {
                 "Type": "Pass",
                 "Parameters": {
-                  "bedrock_prep_mode": "unreviewed_topics",
+                  "use_bedrock": false,
+                  "train_mode": "auto",
+                  "test_mode": "auto",
+                  "data_access_role_arn": "${ComprehendDataAccessRoleArn}",
                   "run_id.$": "States.Format('{}-inference-{}-{}-{}-{}', $.source_config.source_system, $.runtime_parts.execution_date, States.ArrayGetItem($.runtime_parts.time_parts, 0), States.ArrayGetItem($.runtime_parts.time_parts, 1), States.ArrayGetItem($.runtime_parts.time_parts, 2))",
                   "bucket": "${TempBucketName}",
                   "base_prefix": "Sentiment_Analysis",
@@ -1182,6 +1180,79 @@ Resources:
                   "body.$": "States.StringToJson($.Payload.body)"
                 },
                 "ResultPath": "$.final_output_result",
+                "Next": "CheckUseBedrock"
+              },
+              "CheckUseBedrock": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.config.use_bedrock",
+                    "BooleanEquals": true,
+                    "Next": "BedrockPrepLowConfidence"
+                  }
+                ],
+                "Default": "CorrectedDashboardOutput"
+              },
+              "BedrockPrepLowConfidence": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:datalake-bedrock-prep-dev",
+                  "Payload": {
+                    "run_id.$": "$.config.run_id",
+                    "final_output_uri.$": "States.Format('s3://{}/{}/runs/{}/final_output/final_output_all_columns.csv', $.config.bucket, $.config.base_prefix, $.config.run_id)",
+                    "training_data_uri.$": "States.Format('s3://{}/{}/training_data/comprehend_training_with_headers_merged.csv', $.config.bucket, $.config.base_prefix)",
+                    "bedrock_config_prefix.$": "States.Format('s3://{}/{}/bedrock_configs/', $.config.bucket, $.config.base_prefix)",
+                    "bedrock_prep_prefix.$": "States.Format('s3://{}/{}/runs/{}/bedrock_prep/', $.config.bucket, $.config.base_prefix, $.config.run_id)",
+                    "prompt_version.$": "$.config.prompt_version",
+                    "random_seed.$": "$.config.random_seed",
+                    "target_topics.$": "$.config.target_topics",
+                    "confidence_thresholds.$": "$.config.confidence_thresholds"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.bedrock_prep_result",
+                "Next": "BedrockInvokeLowConfidence"
+              },
+              "BedrockInvokeLowConfidence": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:datalake-bedrock-invoke-dev",
+                  "Payload": {
+                    "run_id.$": "$.config.run_id",
+                    "bedrock_prep_manifest_uri.$": "$.bedrock_prep_result.body.bedrock_prep_manifest_uri",
+                    "bedrock_output_prefix.$": "States.Format('s3://{}/{}/runs/{}/bedrock_invoke/', $.config.bucket, $.config.base_prefix, $.config.run_id)",
+                    "target_topics.$": "$.config.target_topics"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.bedrock_invoke_result",
+                "Next": "BedrockMergeCorrections"
+              },
+              "BedrockMergeCorrections": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:datalake-bedrock-merge-dev",
+                  "Payload": {
+                    "bucket.$": "$.config.bucket",
+                    "base_prefix.$": "$.config.base_prefix",
+                    "run_id.$": "$.config.run_id",
+                    "bedrock_corrections_csv_uri.$": "$.bedrock_invoke_result.body.combined_bedrock_corrections_csv_uri"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.bedrock_merge_result",
                 "Next": "CorrectedDashboardOutput"
               },
               "CorrectedDashboardOutput": {
@@ -1240,21 +1311,22 @@ Resources:
                   "skipped.$": "$.Payload.skipped"
                 },
                 "ResultPath": "$.delete_endpoints_result",
-                "Next": "TriggerBedrockPipeline"
+                "Next": "TriggerTrainingEval"
               },
-              "TriggerBedrockPipeline": {
+              "TriggerTrainingEval": {
                 "Type": "Task",
                 "Resource": "arn:aws:states:::states:startExecution",
                 "Parameters": {
-                  "StateMachineArn": "${BedrockPipelineArn}",
+                  "StateMachineArn": "${TrainingPipelineArn}",
                   "Input": {
                     "run_id.$": "$.config.run_id",
-                    "source_system.$": "$.config.source_system",
-                    "bedrock_prep_mode.$": "$.config.bedrock_prep_mode",
+                    "train_mode.$": "$.config.train_mode",
+                    "test_mode.$": "$.config.test_mode",
+                    "data_access_role_arn.$": "$.config.data_access_role_arn",
                     "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
                   }
                 },
-                "ResultPath": "$.trigger_bedrock_result",
+                "ResultPath": "$.trigger_training_eval",
                 "End": true
               }
             }
@@ -1276,8 +1348,8 @@ Resources:
           ComprehendFinalOutputFunctionName: !Ref ComprehendFinalOutputLambda
           ComprehendCorrectedOutputFunctionName: !Ref ComprehendCorrectedOutputLambda
           ComprehendDeleteEndpointsFunctionName: !Ref ComprehendDeleteEndpointsLambda
-          BedrockPipelineArn: !Sub
-            - "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:datalake-bedrock-pipeline-temp-${Suffix}"
+          TrainingPipelineArn: !Sub
+            - "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:datalake-comprehend-training-temp-${Suffix}"
             - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
 
   SurveyMonitorStateMachine:
@@ -1532,11 +1604,7 @@ Resources:
 
   # --- EventBridge: triggers the parent Step Function when the ccaas survey-monitor
   # Step Function (a DIFFERENT, separately-managed stack - datalake-ccaas-sdap-survey-monitor)
-  # completes successfully. Event pattern confirmed via console screenshot of the
-  # live rule. CONFIRMED: the ccaas pipeline has its own separate CloudFormation
-  # stack and is dev-only by design - it will never have a staging deployment.
-  # So the trigger source (ccaas survey-monitor ARN) is intentionally pinned to
-  # "-dev" regardless of THIS stack's DeployEnv - a staging deploy of this
+  # completes successfully. A staging deploy of this
   # sentiment-analysis pipeline still listens for the one real (dev) ccaas
   # execution, since that's the only one that will ever exist.
 

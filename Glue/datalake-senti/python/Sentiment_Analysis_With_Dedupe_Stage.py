@@ -17,7 +17,7 @@ from pyspark.sql.types import DoubleType, DateType
 
 required_args = ["JOB_NAME"]
 optional_args = []
-for opt in ["mode", "ENV", "STAGING"]:
+for opt in ["mode", "ENV", "STAGING", "SURVEYS_TO_PROCESS"]:
     if f"--{opt}" in sys.argv:
         optional_args.append(opt)
 
@@ -29,6 +29,26 @@ ACCOUNT_TIER = "nonprod" if ENV == "dev" else "prod"
 
 STAGING = args.get("STAGING", "dev")
 STAGING_SEGMENT = "" if STAGING == "dev" else STAGING
+
+# Selective manual reprocessing: which surveys to actually process this run.
+# Defaults to "all" (every survey), matching existing behavior when this
+# parameter isn't passed. Accepts a comma-separated list of survey ids, e.g.
+# "ivr,api_relational". Unknown ids are logged and ignored rather than
+# failing the job.
+ALL_SURVEYS = {"ivr", "sms_transactional", "sms_relational", "api_transactional", "api_relational"}
+SURVEYS_TO_PROCESS_RAW = args.get("SURVEYS_TO_PROCESS", "all").strip().lower()
+if SURVEYS_TO_PROCESS_RAW == "all":
+    SURVEYS_TO_PROCESS = set(ALL_SURVEYS)
+else:
+    requested = {s.strip() for s in SURVEYS_TO_PROCESS_RAW.split(",") if s.strip()}
+    unknown = requested - ALL_SURVEYS
+    if unknown:
+        print(f"[SURVEYS_TO_PROCESS] Unknown survey id(s) ignored: {sorted(unknown)}. Valid ids: {sorted(ALL_SURVEYS)}")
+    SURVEYS_TO_PROCESS = requested & ALL_SURVEYS
+    if not SURVEYS_TO_PROCESS:
+        print(f"[SURVEYS_TO_PROCESS] No valid survey ids resolved from '{SURVEYS_TO_PROCESS_RAW}' -- defaulting to all surveys.")
+        SURVEYS_TO_PROCESS = set(ALL_SURVEYS)
+print(f"[SURVEYS_TO_PROCESS] This run will process: {sorted(SURVEYS_TO_PROCESS)}")
 
 sc = SparkContext.getOrCreate()
 glueContext = GlueContext(sc)
@@ -126,6 +146,20 @@ AGG_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/ag
 AGG_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_sms_relational")
 AGG_API_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_api_transactional")
 AGG_API_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/aggregate/tmp_api_relational")
+
+# Monthly YAGO (current year vs. year-ago, same month-of-year cutoff),
+# one single file per survey type, overwritten each run.
+MONTHLY_YAGO_IVR_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/ivr.parquet").rstrip("/")
+MONTHLY_YAGO_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/sms_transactional.parquet").rstrip("/")
+MONTHLY_YAGO_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/sms_relational.parquet").rstrip("/")
+MONTHLY_YAGO_API_TXN_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/api_transactional.parquet").rstrip("/")
+MONTHLY_YAGO_API_REL_FILE = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/api_relational.parquet").rstrip("/")
+
+MONTHLY_YAGO_IVR_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/tmp_ivr")
+MONTHLY_YAGO_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/tmp_sms_transactional")
+MONTHLY_YAGO_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/tmp_sms_relational")
+MONTHLY_YAGO_API_TXN_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/tmp_api_transactional")
+MONTHLY_YAGO_API_REL_TMP = build_path(CURATED_BUCKET, STAGING_SEGMENT, "sentiment_analysis/monthly_yago/tmp_api_relational")
 
 # Removed-records CSV output (campaign filter + dedupe), one file per
 # survey type per event_date.
@@ -508,10 +542,14 @@ for event_date_value in dates_to_process:
     print("Reading available curated datasets")
 
     print(f"IVR read path: {CURATED_IVR_PATH}event_date={event_date_value}/")
-    ivr_raw = safe_read_parquet(
-        f"{CURATED_IVR_PATH}event_date={event_date_value}/",
-        "IVR"
-    )
+    if "ivr" in SURVEYS_TO_PROCESS:
+        ivr_raw = safe_read_parquet(
+            f"{CURATED_IVR_PATH}event_date={event_date_value}/",
+            "IVR"
+        )
+    else:
+        print("[SURVEYS_TO_PROCESS] Skipping IVR (not in this run's survey list)")
+        ivr_raw = None
     if ivr_raw is not None:
         print(f"[INPUT COUNT] IVR records received: {ivr_raw.count()}")
         ivr_verbatim_cols = [c for c in ["q5_overall_exp_comment_in_survey_language", "q5_overall_exp_comment"] if c in ivr_raw.columns]
@@ -533,40 +571,56 @@ for event_date_value in dates_to_process:
         print(f"[INPUT COUNT] IVR: No data found / skipped")
 
     print(f"txn read path: {CURATED_TXN_PATH}event_date={event_date_value}/")
-    txn_raw = safe_read_parquet(
-        f"{CURATED_TXN_PATH}event_date={event_date_value}/",
-        "TXN"
-    )
+    if "sms_transactional" in SURVEYS_TO_PROCESS:
+        txn_raw = safe_read_parquet(
+            f"{CURATED_TXN_PATH}event_date={event_date_value}/",
+            "TXN"
+        )
+    else:
+        print("[SURVEYS_TO_PROCESS] Skipping TXN (not in this run's survey list)")
+        txn_raw = None
     if txn_raw is not None:
         print(f"[INPUT COUNT] TXN records received: {txn_raw.count()}")
     else:
         print(f"[INPUT COUNT] TXN: No data found / skipped")
 
     print(f"rel read path: {CURATED_REL_PATH}event_date={event_date_value}/")
-    rel_raw = safe_read_parquet(
-        f"{CURATED_REL_PATH}event_date={event_date_value}/",
-        "REL"
-    )
+    if "sms_relational" in SURVEYS_TO_PROCESS:
+        rel_raw = safe_read_parquet(
+            f"{CURATED_REL_PATH}event_date={event_date_value}/",
+            "REL"
+        )
+    else:
+        print("[SURVEYS_TO_PROCESS] Skipping REL (not in this run's survey list)")
+        rel_raw = None
     if rel_raw is not None:
         print(f"[INPUT COUNT] REL records received: {rel_raw.count()}")
     else:
         print(f"[INPUT COUNT] REL: No data found / skipped")
 
     print(f"api txn read path: {CURATED_API_TXN_PATH}event_date={event_date_value}/")
-    api_txn_raw = safe_read_parquet(
-        f"{CURATED_API_TXN_PATH}event_date={event_date_value}/",
-        "API TXN"
-    )
+    if "api_transactional" in SURVEYS_TO_PROCESS:
+        api_txn_raw = safe_read_parquet(
+            f"{CURATED_API_TXN_PATH}event_date={event_date_value}/",
+            "API TXN"
+        )
+    else:
+        print("[SURVEYS_TO_PROCESS] Skipping API TXN (not in this run's survey list)")
+        api_txn_raw = None
     if api_txn_raw is not None:
         print(f"[INPUT COUNT] API TXN records received: {api_txn_raw.count()}")
     else:
         print(f"[INPUT COUNT] API TXN: No data found / skipped")
 
     print(f"api rel read path: {CURATED_API_REL_PATH}event_date={event_date_value}/")
-    api_rel_raw = safe_read_parquet(
-        f"{CURATED_API_REL_PATH}event_date={event_date_value}/",
-        "API REL"
-    )
+    if "api_relational" in SURVEYS_TO_PROCESS:
+        api_rel_raw = safe_read_parquet(
+            f"{CURATED_API_REL_PATH}event_date={event_date_value}/",
+            "API REL"
+        )
+    else:
+        print("[SURVEYS_TO_PROCESS] Skipping API REL (not in this run's survey list)")
+        api_rel_raw = None
     if api_rel_raw is not None:
         print(f"[INPUT COUNT] API REL records received: {api_rel_raw.count()}")
     else:
@@ -1154,11 +1208,114 @@ except Exception as e:
     logger.error(f"Failed to write daily aggregate files. Error: {str(e)}")
     raise
 
+# MONTHLY YAGO (current year vs. year-ago, same month-of-year cutoff)
+# Computed once per run, for all 5 survey types, independent of
+# SURVEYS_TO_PROCESS -- reads full historical FINAL_*_PATH data fresh each
+# time, same "don't gate on the loop's last iteration" principle as the
+# cumulative daily aggregate above. Bounds both years to the same
+# month-of-year cutoff (Jan through the current month, for both years) so
+# the comparison is apples-to-apples rather than partial-year vs full-year.
+print("Computing monthly YAGO (current year vs. year-ago, same month cutoff)")
+cutoff_month = date.today().month
+yago_year = current_year - 1
+
+def compute_monthly_yago(final_path, label, score_exprs):
+    try:
+        history = spark.read.parquet(final_path.rstrip("/"))
+
+        current_part = history.filter(
+            (F.year(F.col("event_date")) == current_year) &
+            (F.month(F.col("event_date")) <= cutoff_month)
+        ).groupBy(F.month(F.col("event_date")).alias("month")).agg(
+            *score_exprs,
+            F.count(F.lit(1)).alias("record_count")
+        ).withColumn("year_label", F.lit("current"))
+
+        yago_part = history.filter(
+            (F.year(F.col("event_date")) == yago_year) &
+            (F.month(F.col("event_date")) <= cutoff_month)
+        ).groupBy(F.month(F.col("event_date")).alias("month")).agg(
+            *score_exprs,
+            F.count(F.lit(1)).alias("record_count")
+        ).withColumn("year_label", F.lit("yago"))
+
+        combined = current_part.unionByName(yago_part).withColumn("calculated_date", calculated_date)
+        print(f"[MONTHLY YAGO] {label}: computed months 1-{cutoff_month} for {current_year} (current) and {yago_year} (yago)")
+        return combined
+    except Exception as e:
+        print(f"[MONTHLY YAGO] {label}: no historical data found at {final_path}, skipping. ({str(e)})")
+        return None
+
+ivr_monthly_yago = compute_monthly_yago(
+    FINAL_IVR_PATH, "IVR",
+    [
+        F.avg("q1_csat_with_ivr").alias("q1_avg_csat"),
+        F.avg("q2_ease_with_ivr").alias("q2_avg_csat"),
+        F.avg("q3_csat_with_pseg_li").alias("q3_avg_csat"),
+    ]
+)
+txn_monthly_yago = compute_monthly_yago(
+    FINAL_TXN_PATH, "TXN",
+    [
+        F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q2_effort_value").alias("q2_avg_csat"),
+        F.avg("q3_overall_satisfaction").alias("q3_avg_csat"),
+    ]
+)
+rel_monthly_yago = compute_monthly_yago(
+    FINAL_REL_PATH, "REL",
+    [
+        F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q3_effort_value").alias("q2_avg_csat"),
+        F.avg("q4_overall_satisfaction").alias("q3_avg_csat"),
+    ]
+)
+api_txn_monthly_yago = compute_monthly_yago(
+    FINAL_API_TXN_PATH, "API TXN",
+    [
+        F.avg("q1_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q2_effort_value").alias("q2_avg_csat"),
+        F.avg("q3_overall_satisfaction").alias("q3_avg_csat"),
+    ]
+)
+api_rel_monthly_yago = compute_monthly_yago(
+    FINAL_API_REL_PATH, "API REL",
+    [
+        F.avg("q2_satisfaction_value").alias("q1_avg_csat"),
+        F.avg("q3_effort_value").alias("q2_avg_csat"),
+        F.avg("q4_overall_satisfaction").alias("q3_avg_csat"),
+    ]
+)
+
+# WRITE MONTHLY YAGO (one file per survey type, overwrite mode)
+try:
+    print("Writing monthly YAGO files (overwrite)")
+    if ivr_monthly_yago is not None:
+        write_single_file(ivr_monthly_yago, MONTHLY_YAGO_IVR_FILE, MONTHLY_YAGO_IVR_TMP, "IVR MONTHLY YAGO")
+    if txn_monthly_yago is not None:
+        write_single_file(txn_monthly_yago, MONTHLY_YAGO_TXN_FILE, MONTHLY_YAGO_TXN_TMP, "TXN MONTHLY YAGO")
+    if rel_monthly_yago is not None:
+        write_single_file(rel_monthly_yago, MONTHLY_YAGO_REL_FILE, MONTHLY_YAGO_REL_TMP, "REL MONTHLY YAGO")
+    if api_txn_monthly_yago is not None:
+        write_single_file(api_txn_monthly_yago, MONTHLY_YAGO_API_TXN_FILE, MONTHLY_YAGO_API_TXN_TMP, "API TXN MONTHLY YAGO")
+    if api_rel_monthly_yago is not None:
+        write_single_file(api_rel_monthly_yago, MONTHLY_YAGO_API_REL_FILE, MONTHLY_YAGO_API_REL_TMP, "API REL MONTHLY YAGO")
+    print("Monthly YAGO files written successfully")
+except Exception as e:
+    logger.error(f"Failed to write monthly YAGO files. Error: {str(e)}")
+    raise
+
 # TRACKER TABLE WRITE: this job is now the sole writer of the per-day tracker
 # record (the downstream curation job's DynamoDB write is being removed).
 # Availability flags use the same "post-dedup dataframe has >0 rows, False if
 # None" definition previously used by the curation job, based on the last
 # event_date processed in the loop above.
+#
+# Uses update_item (not put_item) so a selective SURVEYS_TO_PROCESS run only
+# touches the availability flags for surveys actually processed this run --
+# a survey that was skipped keeps whatever availability status was last
+# written for it by a full run, rather than getting silently overwritten
+# with False just because this run didn't check it.
 execution_date_today = date.today().isoformat()
 
 ivr_available = ivr_final is not None and ivr_final.count() > 0
@@ -1168,20 +1325,37 @@ api_txn_available = api_txn_final is not None and api_txn_final.count() > 0
 api_rel_available = api_rel_final is not None and api_rel_final.count() > 0
 
 try:
-    print(f"[TRACKER] Writing tracker record for execution_date={execution_date_today}")
+    print(f"[TRACKER] Updating tracker record for execution_date={execution_date_today}")
     tracker_table = dynamodb.Table(TRACKER_TABLE_NAME)
-    tracker_table.put_item(
-        Item={
-            "execution_date": execution_date_today,
-            "ivr_available": ivr_available,
-            "sms_web_relational_available": rel_available,
-            "sms_web_transactional_available": txn_available,
-            "api_web_transactional_available": api_txn_available,
-            "api_web_relational_available": api_rel_available,
-            "dates_processed": all_dates_processed,
-            "source_new_records": source_new_records_report,
-        }
+
+    update_expr_parts = ["dates_processed = :dates", "source_new_records = :records"]
+    expr_values = {
+        ":dates": all_dates_processed,
+        ":records": source_new_records_report,
+    }
+
+    if "ivr" in SURVEYS_TO_PROCESS:
+        update_expr_parts.append("ivr_available = :ivr_avail")
+        expr_values[":ivr_avail"] = ivr_available
+    if "sms_transactional" in SURVEYS_TO_PROCESS:
+        update_expr_parts.append("sms_web_transactional_available = :txn_avail")
+        expr_values[":txn_avail"] = txn_available
+    if "sms_relational" in SURVEYS_TO_PROCESS:
+        update_expr_parts.append("sms_web_relational_available = :rel_avail")
+        expr_values[":rel_avail"] = rel_available
+    if "api_transactional" in SURVEYS_TO_PROCESS:
+        update_expr_parts.append("api_web_transactional_available = :api_txn_avail")
+        expr_values[":api_txn_avail"] = api_txn_available
+    if "api_relational" in SURVEYS_TO_PROCESS:
+        update_expr_parts.append("api_web_relational_available = :api_rel_avail")
+        expr_values[":api_rel_avail"] = api_rel_available
+
+    tracker_table.update_item(
+        Key={"execution_date": execution_date_today},
+        UpdateExpression="SET " + ", ".join(update_expr_parts),
+        ExpressionAttributeValues=expr_values
     )
+    print(f"[TRACKER] Updated availability for surveys processed this run: {sorted(SURVEYS_TO_PROCESS)}")
     print(f"[TRACKER] ivr_available={ivr_available} | sms_web_relational_available={rel_available} | sms_web_transactional_available={txn_available} | api_web_transactional_available={api_txn_available} | api_web_relational_available={api_rel_available}")
     print(f"[TRACKER] dates_processed={all_dates_processed}")
     print(f"[TRACKER] source_new_records={source_new_records_report}")
