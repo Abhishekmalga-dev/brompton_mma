@@ -1,0 +1,1887 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Sentiment Analysis Data Lake Pipeline - daily-use survey/comprehend pipeline.
+  Deploys the sentiment-analysis Glue jobs, Lambda functions, Step Functions,
+  EventBridge trigger, and SNS alerting for the CCaaS survey -> sentiment ->
+  Comprehend classification pipeline. The model-training/eval pipeline
+  (datalake-comprehend-training-temp) is intentionally out of scope and lives
+  in a separate CloudFormation stack so it can be updated independently.
+
+Parameters:
+
+  DeployEnv:
+    Type: String
+    Description: "Deployment environment. dev and staging both deploy into the nonprod AWS account as fully independent, parallel stacks. prod is reserved for future use."
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  # --- Existing S3 buckets (NOT created by this template - see Ground Rule 2) ---
+
+  ArtifactBucket:
+    Type: String
+    Description: "Existing S3 bucket where CI/CD uploads Lambda zips, Glue scripts, and Step Function definitions for this pipeline."
+    Default: psegli-datalakenonprodli-datalake-build-dev
+
+  CuratedBucketName:
+    Type: String
+    Description: "Existing S3 bucket holding curated survey data - source for the sentiment/comprehend pipeline (sentiment_analysis/final/{source}/ paths)."
+    Default: psegli-datalakenonprodli-datalake-curated-dev
+
+  TempBucketName:
+    Type: String
+    Description: "Existing S3 bucket used as scratch/working storage by the comprehend pipeline (Sentiment_Analysis/raw_data, runs/, etc.)."
+    Default: psegli-datalakenonprodli-datalake-temp-dev
+
+  GlueTempDirPath:
+    Type: String
+    Description: >-
+      Existing S3 path used as the Glue "--TempDir" working directory for the
+      sentiment-analysis and sentiment-analysis-curation jobs. NOTE: this is a
+      distinct bucket (build-nonprod) from ArtifactBucket (build-dev) - confirmed
+      via Job details screenshot, not assumed. Flagging for confirmation since it
+      doesn't follow the same naming pattern as the other three bucket parameters.
+    Default: s3://psegli-datalakenonprodli-datalake-build-nonprod/datalake-nonprod-Glue_Temp/
+
+  # --- Existing shared IAM roles (NOT created by this template - see Ground Rule 1) ---
+  # NOTE: confirmed with lead - these three roles stay pinned to their "-dev" suffix
+  # regardless of DeployEnv. A "staging" deploy still executes under the "-dev" roles.
+  # There is no "-staging" variant of these roles today.
+
+  LambdaExecutionRoleName:
+    Type: String
+    Description: "Existing shared IAM role name for Lambda execution. Intentionally NOT parameterized by DeployEnv - stays pinned to '-dev' for both dev and staging deploys."
+    Default: Lambda-execution-datalake-dev
+
+  StepFunctionExecutionRoleName:
+    Type: String
+    Description: "Existing shared IAM role name for Step Functions execution. Intentionally NOT parameterized by DeployEnv - stays pinned to '-dev' for both dev and staging deploys."
+    Default: stepfunction-execution-datalake-dev
+
+  GlueServiceRoleName:
+    Type: String
+    Description: "Existing shared IAM role name for Glue job execution. Intentionally NOT parameterized by DeployEnv - stays pinned to '-dev' for both dev and staging deploys."
+    Default: AWSGlueServiceRole-datalake-dev
+
+  EventBridgeToStepFunctionsRoleName:
+    Type: String
+    Description: "Existing shared IAM role name allowing EventBridge rules to start Step Functions executions. Intentionally NOT parameterized by DeployEnv."
+    Default: EventBridgeServiceToStepFunctionsRole-datalake-dev
+
+  # --- Cross-service role that structurally requires manual creation (Ground Rule 1) ---
+  # This is NOT one of our three reusable shared roles. Comprehend needs a role it can
+  # assume for cross-service data access (S3 read for training/inference data). This
+  # must be created manually outside this template if it does not already exist for
+  # the target environment - flagging per Ground Rule 1 rather than creating it inline.
+
+  ComprehendDataAccessRoleArn:
+    Type: String
+    Description: "ARN of the existing IAM role Comprehend assumes for cross-service S3 data access. NOT created by this template - must exist already (see AmazonComprehendServiceRole-DataLakeNonProd for dev)."
+    Default: arn:aws:iam::053234861925:role/service-role/AmazonComprehendServiceRole-DataLakeNonProd
+
+  # --- Versioning / artifacts ---
+
+  CodeVersion:
+    Type: String
+    Description: "Short git SHA or version identifier for artifacts, matching the CI/CD packaging convention (first 7 chars of GITHUB_SHA)."
+    Default: latest
+
+  SentimentArtifactPrefix:
+    Type: String
+    Description: "S3 key prefix (within ArtifactBucket) where CI/CD uploads this pipeline's Lambda zips and Glue scripts. Kept separate from the ccaas pipeline's 'ccaas-artifact' prefix."
+    Default: sentiment-artifact
+
+  # --- Alerting ---
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: "Optional email address to subscribe to the sentiment-analysis SNS alerts topic. Leave blank to create the topic with no subscription (e.g. for a staging deploy where no one should be auto-subscribed)."
+
+Conditions:
+
+  IsProd: !Equals [!Ref DeployEnv, "prod"]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Mappings:
+  # NOTE on ResourceSuffix (org naming rule, confirmed 2026-07-23):
+  # Every resource this template creates must have a name ending in "-dev"
+  # (nonprod tier) or "-prod" (prod tier) - resources not following this
+  # convention will not be created / will be rejected. Because "staging" is
+  # a CloudFormation-only concept (dev and staging share the same nonprod
+  # AWS account), a staging deploy inserts "staging-" as a middle segment
+  # rather than replacing the mandatory trailing "-dev":
+  #   dev:      datalake-<resource>-dev
+  #   staging:  datalake-<resource>-staging-dev
+  #   prod:     datalake-<resource>-prod
+  # This is distinct from StagingArg, which drives the Glue job's internal
+  # "--STAGING" argument (S3 data-path segmentation), per the original spec.
+  EnvConfig:
+    dev:
+      AccountTier: nonprod
+      StagingArg: "dev"
+      ResourceSuffix: "dev"
+    staging:
+      AccountTier: nonprod
+      StagingArg: "staging"
+      ResourceSuffix: "staging-dev"
+    prod:
+      AccountTier: prod
+      StagingArg: "dev"
+      ResourceSuffix: "prod"
+
+Resources:
+
+  # --- SNS: failure alerting for the sentiment analysis pipeline ---
+  # Replicated per environment (dev / staging / prod each get their own topic),
+  # per confirmed decision: dev already has a live topic + confirmed email
+  # subscription (datalake-sentiment-analysis-alerts-dev) that this template
+  # will now formally manage going forward, and staging/prod get their own
+  # independent copies when deployed.
+
+  SentimentAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - "datalake-sentiment-analysis-alerts-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+
+  SentimentAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref SentimentAlertsTopic
+
+  # --- Glue Jobs ---
+  # NOTE on ScriptLocation naming: today's live jobs use plain, unversioned
+  # script filenames (e.g. "datalake-sentiment-analysis-dev.py"), configured
+  # manually. Once this template + updated CI/CD own these jobs, scripts need
+  # to be uploaded as versioned artifacts to be reproducible/rollback-able -
+  # so ScriptLocation below follows the same "{name}_{CodeVersion}_{EnvToken}.py"
+  # convention already used by the ccaas pipeline's CI/CD. EnvToken here is
+  # "dev"/"prod" (via IsProd), NOT the staging-aware ResourceSuffix - CONFIRMED:
+  # dev and staging share the same compiled script artifact (same nonprod
+  # tier, same code); only the job's *name* and *runtime arguments* (--STAGING)
+  # differ between dev and staging, not the underlying script file.
+
+  SentimentAnalysisGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub
+        - "datalake-sentiment-analysis-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}"
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub
+          - "s3://${ArtifactBucket}/${SentimentArtifactPrefix}/datalake-sentiment-analysis_${CodeVersion}_${EnvToken}.py"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      MaxRetries: 0
+      Timeout: 480
+      ExecutionProperty:
+        MaxConcurrentRuns: 5
+      DefaultArguments:
+        "--TempDir": !Ref GlueTempDirPath
+        "--conf": "spark.eventLog.rolling.enabled=true"
+        "--mode": "manual"
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--enable-metrics": "true"
+        "--enable-observability-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--ENV": !If [IsProd, "prod", "dev"]
+        "--STAGING": !FindInMap [EnvConfig, !Ref DeployEnv, StagingArg]
+
+  SentimentAnalysisCurationGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub
+        - "datalake-sentiment-analysis-curation-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}"
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub
+          - "s3://${ArtifactBucket}/${SentimentArtifactPrefix}/datalake-sentiment-analysis-curation_${CodeVersion}_${EnvToken}.py"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      MaxRetries: 0
+      Timeout: 480
+      ExecutionProperty:
+        MaxConcurrentRuns: 5
+      DefaultArguments:
+        "--TempDir": !Ref GlueTempDirPath
+        "--conf": "spark.eventLog.rolling.enabled=true"
+        "--mode": "manual"
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--enable-metrics": "true"
+        "--enable-observability-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--ENV": !If [IsProd, "prod", "dev"]
+        "--STAGING": !FindInMap [EnvConfig, !Ref DeployEnv, StagingArg]
+
+  ComprehendGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub
+        - "datalake-comprehend-glue-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}"
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub
+          - "s3://${ArtifactBucket}/datalake_nonprod-Glue_Scripts/datalake-comprehend-glue_${CodeVersion}_${EnvToken}.py"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      MaxRetries: 0
+      Timeout: 480
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      DefaultArguments:
+        "--TempDir": !Sub "s3://aws-glue-assets-${AWS::AccountId}-${AWS::Region}/temporary/"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://aws-glue-assets-${AWS::AccountId}-${AWS::Region}/sparkHistoryLogs/"
+        "--conf": "spark.eventLog.rolling.enabled=true"
+      Tags:
+        use-case: sentiment-analysis
+
+  # --- CCaaS Reconciliation Report Glue Job ---
+  # PySpark job (glueetl, not pythonshell), GlueVersion 5.1 to match every other
+  # Glue job in this stack (confirmed - overrides the originally-requested 5.0).
+  # Script path follows the SentimentAnalysisGlueJob convention (parameterized
+  # ${SentimentArtifactPrefix}), per confirmed decision, even though this job is
+  # CCaaS-specific rather than sentiment-specific - kept in the same shared
+  # artifact folder rather than creating a new prefix parameter.
+  #
+  # --EVENT_DATE is intentionally NOT included in DefaultArguments: it's a
+  # single-date manual-run override, read via manual sys.argv parsing in the
+  # job script (per this project's established convention), and left absent
+  # by default so a normal scheduled/triggered run doesn't accidentally pin
+  # itself to one date. Pass it at invocation time only when doing a targeted
+  # single-date run.
+  #
+  # --EVENT_DATES_S3_PATH DOES have a real default, confirmed via console
+  # screenshot of the live job's Job Parameters tab - it's not actually
+  # optional/absent in practice the way --EVENT_DATE is, so it's included
+  # below with its real value.
+
+  ReconciliationReportGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub
+        - "datalake-ccaas-reconciliation-report-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}"
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub
+          - "s3://${ArtifactBucket}/${SentimentArtifactPrefix}/datalake-ccaas-reconciliation-report_${CodeVersion}_${EnvToken}.py"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      MaxRetries: 0
+      Timeout: 480
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      DefaultArguments:
+        "--TempDir": !Ref GlueTempDirPath
+        "--conf": "spark.eventLog.rolling.enabled=true"
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--enable-metrics": "true"
+        "--enable-observability-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--ENV": !If [IsProd, "prod", "dev"]
+        "--EVENT_DATES_S3_PATH": "s3://psegli-datalakenonprodli-datalake-temp-dev/ccaas/event_dates/survey_api_json/event_dates.json"
+      Tags:
+        use-case: ccaas-reconciliation
+  # Replicated per environment (Option 2, per confirmed decision). Schema confirmed
+  # via console: partition key execution_date (String), no sort key, on-demand
+  # billing, no GSIs, PITR off. The Lambda now reads this table's name from the
+  # TRACKER_TABLE_NAME environment variable (code updated to remove the previous
+  # hardcoded "datalake-sentiment-analysis-tracker-dev" literal).
+
+  SentimentAnalysisTrackerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - "datalake-sentiment-analysis-tracker-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: execution_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: execution_date
+          KeyType: HASH
+
+  # --- CCaaS Reconciliation Report Crawler ---
+  # Catalogs the Glue job's output. NOT triggered by EventBridge or any
+  # schedule - per confirmed decision, the Glue job itself calls
+  # boto3 start_crawler() at the end of a successful run. This resource only
+  # needs to exist for that call to have a crawler to target; no trigger
+  # resource is created here.
+  #
+  # DatabaseName confirmed via Glue console screenshot of Data Catalog ->
+  # Databases: "datalake-sentiment-analysis-dev" - same database every other
+  # CCaaS/sentiment table in this project is cataloged under, exactly as
+  # originally guessed but confirmed rather than assumed.
+
+  ReconciliationReportCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub
+        - "datalake-reconciliation-report-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}"
+      DatabaseName: datalake-sentiment-analysis-dev
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${CuratedBucketName}/ccaas/data_reconciliation_report/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # --- CCaaS Reconciliation DynamoDB table ---
+  # Same shape/pattern as SentimentAnalysisTrackerTable above (on-demand
+  # billing, no GSIs/LSIs), extended with a sort key per the confirmed schema:
+  # partition key event_date (String), sort key survey_type (String) - allows
+  # multiple survey types to be tracked per date without overwriting each
+  # other, same reasoning as the update_item-over-put_item principle already
+  # established for the sentiment tracker table.
+
+  ReconciliationTrackerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - "datalake-ccaas-reconciliation-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_date
+          AttributeType: S
+        - AttributeName: survey_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_date
+          KeyType: HASH
+        - AttributeName: survey_type
+          KeyType: RANGE
+
+  # --- Lambda Functions (13 total) ---
+  # Shared settings (Runtime/Timeout/MemorySize/EphemeralStorage) confirmed via
+  # console screenshot of an existing function's Configuration tab. Handler
+  # convention (python.<filename>.lambda_handler) confirmed via repo folder
+  # structure - every function's zip contains a python/ subfolder.
+
+  ComprehendActionableLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-actionable-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-actionable.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-actionable_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendCleanTempLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-clean-temp-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-clean-temp.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-clean-temp_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendCorrectedOutputLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-corrected-output-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-corrected-output.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-corrected-output_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendCreateEndpointsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-create-endpoints-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-create-endpoints.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-create-endpoints_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendDeleteEndpointsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-delete-endpoints-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-delete-endpoints.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-delete-endpoints_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendFinalOutputLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-final-output-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-final-output.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-final-output_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendLevel2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-level2-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-level2.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-level2_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendLevel3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-level3-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-level3.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-level3_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendLevel4Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-level4-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-level4.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-level4_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendRawStatusCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-raw-status-check-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-raw-status-check.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-raw-status-check_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendSentimentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-sentiment-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-sentiment.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-sentiment_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendUrgentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-urgent-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-urgent.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-comprehend-urgent_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  SentimentAnalysisGetAvailabilityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-sentiment-analysis-get-availability-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-sentiment-analysis-get-availability.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${SentimentArtifactPrefix}/datalake-sentiment-analysis-get-availability_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+          TRACKER_TABLE_NAME: !Ref SentimentAnalysisTrackerTable
+
+  # --- IAM: scoped policy additions on existing shared roles ---
+  # Per Ground Rule 1: no new roles created. These are named inline policies
+  # attached to the existing shared roles. Each is a distinct, independently
+  # named AWS::IAM::Policy resource - if this stack is ever deleted, only
+  # these specific named policies are removed (via iam:DeleteRolePolicy on
+  # their PolicyName), not any other permissions already on the shared role.
+  # Safe to attach/detach without affecting other pipelines using these roles.
+
+  StepFunctionInvokeGetAvailabilityPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: sentiment-analysis-invoke-get-availability
+      Roles:
+        - !Ref StepFunctionExecutionRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt SentimentAnalysisGetAvailabilityLambda.Arn
+
+  GlueServiceTrackerTablePutItemPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: sentiment-analysis-tracker-table-putitem
+      Roles:
+        - !Ref GlueServiceRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: dynamodb:PutItem
+            Resource: !GetAtt SentimentAnalysisTrackerTable.Arn
+
+  # --- Step Functions ---
+  # Building smallest/least-nested first: the child (ComprehendPipelineStateMachine)
+  # is defined before the parent (SurveyMonitorStateMachine) even though the parent
+  # appears first in the pipeline flow, so the parent's !GetAtt reference to the
+  # child's Arn is a backward reference (already-defined), not a forward one.
+
+  ComprehendPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub
+        - "datalake-comprehend-pipeline-temp-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StepFunctionExecutionRoleName}"
+      StateMachineType: STANDARD
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Customer text analytics inference pipeline with clean prep, parallel inference, endpoint creation/deletion, and final output.",
+            "StartAt": "GenerateRuntimeParts",
+            "States": {
+              "GenerateRuntimeParts": {
+                "Type": "Pass",
+                "Parameters": {
+                  "execution_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
+                  "execution_time_raw.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 1)"
+                },
+                "ResultPath": "$.runtime_parts",
+                "Next": "SplitRuntimeTime"
+              },
+              "SplitRuntimeTime": {
+                "Type": "Pass",
+                "Parameters": {
+                  "execution_date.$": "$.runtime_parts.execution_date",
+                  "time_parts.$": "States.StringSplit($.runtime_parts.execution_time_raw, '.:Z')"
+                },
+                "ResultPath": "$.runtime_parts",
+                "Next": "SelectSourceConfig"
+              },
+              "SelectSourceConfig": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.source",
+                    "StringEquals": "ivr",
+                    "Next": "SetIvrSourceConfig"
+                  },
+                  {
+                    "Variable": "$.source",
+                    "StringEquals": "sms_web_relational",
+                    "Next": "SetSmsWebRelationalSourceConfig"
+                  },
+                  {
+                    "Variable": "$.source",
+                    "StringEquals": "sms_web_transactional",
+                    "Next": "SetSmsWebTransactionalSourceConfig"
+                  }
+                ],
+                "Default": "UnsupportedSource"
+              },
+              "UnsupportedSource": {
+                "Type": "Fail",
+                "Error": "UnsupportedSource",
+                "Cause": "Input field $.source must be one of: ivr, sms_web_relational, sms_web_transactional"
+              },
+              "SetIvrSourceConfig": {
+                "Type": "Pass",
+                "Result": {
+                  "source_system": "ivr",
+                  "source_bucket": "${CuratedBucketName}",
+                  "source_prefix": "sentiment_analysis/final/ivr/",
+                  "manifest_key": "customer_sat_ivr_primary_manifest.json",
+                  "dest_bucket": "${TempBucketName}",
+                  "dest_prefix": "Sentiment_Analysis/raw_data/",
+                  "primary_output_file": "customer_sat_ivr_primary.snappy.parquet",
+                  "text_column": "q5_overall_exp_comment",
+                  "fallback_text_column": "q5_overall_exp_comment_in_survey_language",
+                  "record_id_column": "contact_record_id",
+                  "event_date_column": "event_date",
+                  "survey_language_column": "language",
+                  "pii_text_column": "q5_overall_exp_comment"
+                },
+                "ResultPath": "$.source_config",
+                "Next": "GeneratePipelineConfig"
+              },
+              "SetSmsWebRelationalSourceConfig": {
+                "Type": "Pass",
+                "Result": {
+                  "source_system": "sms_web_relational",
+                  "source_bucket": "${CuratedBucketName}",
+                  "source_prefix": "sentiment_analysis/final/sms_web_relational/",
+                  "manifest_key": "survey_sms_web_relational_primary_manifest.json",
+                  "dest_bucket": "${TempBucketName}",
+                  "dest_prefix": "Sentiment_Analysis/raw_data/",
+                  "primary_output_file": "customer_sat_sms_web_relational_primary.snappy.parquet",
+                  "text_column": "q5_comment_sms",
+                  "fallback_text_column": "q5_comment_in_survey_language_sms",
+                  "record_id_column": "contact_record_id",
+                  "event_date_column": "survey_event_date",
+                  "survey_language_column": "survey_language",
+                  "pii_text_column": "q5_comment_sms"
+                },
+                "ResultPath": "$.source_config",
+                "Next": "GeneratePipelineConfig"
+              },
+              "SetSmsWebTransactionalSourceConfig": {
+                "Type": "Pass",
+                "Result": {
+                  "source_system": "sms_web_transactional",
+                  "source_bucket": "${CuratedBucketName}",
+                  "source_prefix": "sentiment_analysis/final/sms_web_transactional/",
+                  "manifest_key": "survey_sms_web_transactional_primary_manifest.json",
+                  "dest_bucket": "${TempBucketName}",
+                  "dest_prefix": "Sentiment_Analysis/raw_data/",
+                  "primary_output_file": "customer_sat_sms_web_transactional_primary.snappy.parquet",
+                  "text_column": "q4_comment_sms",
+                  "fallback_text_column": "q4_comment_in_survey_language_sms",
+                  "record_id_column": "contact_record_id",
+                  "event_date_column": "survey_event_date",
+                  "survey_language_column": "survey_language",
+                  "pii_text_column": "q4_comment_sms"
+                },
+                "ResultPath": "$.source_config",
+                "Next": "GeneratePipelineConfig"
+              },
+              "GeneratePipelineConfig": {
+                "Type": "Pass",
+                "Parameters": {
+                  "bedrock_prep_mode": "unreviewed_topics",
+                  "run_id.$": "States.Format('{}-inference-{}-{}-{}-{}', $.source_config.source_system, $.runtime_parts.execution_date, States.ArrayGetItem($.runtime_parts.time_parts, 0), States.ArrayGetItem($.runtime_parts.time_parts, 1), States.ArrayGetItem($.runtime_parts.time_parts, 2))",
+                  "bucket": "${TempBucketName}",
+                  "base_prefix": "Sentiment_Analysis",
+                  "training_bucket": "${ArtifactBucket}",
+                  "training_summary_key": "training_summary.json",
+                  "current_endpoint_summary_key": "current_endpoint_summary.json",
+                  "raw_data_s3_prefix.$": "States.Format('s3://{}/Sentiment_Analysis/raw_data/', $.source_config.dest_bucket)",
+                  "runs_s3_prefix.$": "States.Format('s3://{}/Sentiment_Analysis/runs/', $.source_config.dest_bucket)",
+                  "source_system.$": "$.source_config.source_system",
+                  "source_bucket.$": "$.source_config.source_bucket",
+                  "source_prefix.$": "$.source_config.source_prefix",
+                  "manifest_key.$": "$.source_config.manifest_key",
+                  "dest_bucket.$": "$.source_config.dest_bucket",
+                  "dest_prefix.$": "$.source_config.dest_prefix",
+                  "primary_output_file.$": "$.source_config.primary_output_file",
+                  "input_format": "parquet",
+                  "text_column.$": "$.source_config.text_column",
+                  "fallback_text_column.$": "$.source_config.fallback_text_column",
+                  "record_id_column.$": "$.source_config.record_id_column",
+                  "event_date_column.$": "$.source_config.event_date_column",
+                  "pii_text_column.$": "$.source_config.pii_text_column",
+                  "language_column.$": "$.source_config.survey_language_column",
+                  "metadata_columns": [],
+                  "max_records": 100000,
+                  "translation_enabled": true,
+                  "translation_source_language": "spanish",
+                  "translation_target_language": "english",
+                  "pii_column": "has_pii",
+                  "sentiment_mode": "both",
+                  "language_code": "en",
+                  "text_field": "customer_text_clean",
+                  "record_id_field": "record_id",
+                  "oversize_strategy": "skip",
+                  "include_mixed": true,
+                  "level2_classifier_mode": "endpoint",
+                  "level3_classifier_mode": "endpoint",
+                  "level3_confidence_threshold": 0.75,
+                  "level4_classifier_mode": "endpoint",
+                  "urgent_classifier_mode": "endpoint",
+                  "actionable_classifier_mode": "endpoint",
+                  "models": ["level2", "level2_sms_web", "level3", "level3_sms_web", "level4", "level4_sms_web", "actionable", "urgent"],
+                  "prompt_version": "v1",
+                  "random_seed": 42,
+                  "target_topics": ["overall_sentiment", "level2_category", "level3_subcategory", "level4_team", "is_actionable", "is_urgent"],
+                  "confidence_thresholds": {
+                    "overall_sentiment": 0.75,
+                    "level2_category": 0.7,
+                    "level3_subcategory": 0.7,
+                    "level4_team": 0.7,
+                    "is_actionable": 0.75,
+                    "is_urgent": 0.7
+                  },
+                  "desired_inference_units": 10,
+                  "wait_for_ready": true,
+                  "validate_classifiers": false,
+                  "fallback_to_list_classifiers": false,
+                  "use_list_endpoints_fallback": true,
+                  "fail_on_missing_model": true,
+                  "wait_for_deleted": false,
+                  "fail_on_delete_error": false,
+                  "update_dlportal": true,
+                  "dlportal_source_tables": ["sentiment_analysis_trimmed_dashboard_ivr", "sentiment_analysis_trimmed_dashboard_sms_web_relational", "sentiment_analysis_trimmed_dashboard_sms_web_transactional"],
+                  "dlportal_target_table": "sentiment_analysis_trimmed_dashboard",
+                  "update_corrected_file": true,
+                  "dlportal_corrected_table": "sentiment_corrected"
+                },
+                "ResultPath": "$.config",
+                "Next": "PrepareRawDataAndEndpointsInParallel"
+              },
+              "PrepareRawDataAndEndpointsInParallel": {
+                "Type": "Parallel",
+                "Branches": [
+                  {
+                    "StartAt": "CreateOrUpdateComprehendEndpoints",
+                    "States": {
+                      "CreateOrUpdateComprehendEndpoints": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendCreateEndpointsFunctionName}",
+                          "Payload": {
+                            "run_id.$": "$.config.run_id",
+                            "source_system.$": "$.config.source_system",
+                            "create_endpoints.$": "$.create_endpoints",
+                            "training_bucket.$": "$.config.training_bucket",
+                            "training_summary_key.$": "$.config.training_summary_key",
+                            "endpoint_summary_key.$": "States.Format('endpoint_summary/{}/endpoint_summary.json', $.config.run_id)",
+                            "current_endpoint_summary_key.$": "$.config.current_endpoint_summary_key",
+                            "models.$": "$.config.models",
+                            "desired_inference_units.$": "$.config.desired_inference_units",
+                            "wait_for_ready.$": "$.config.wait_for_ready",
+                            "validate_classifiers.$": "$.config.validate_classifiers",
+                            "fallback_to_list_classifiers.$": "$.config.fallback_to_list_classifiers",
+                            "use_list_endpoints_fallback.$": "$.config.use_list_endpoints_fallback",
+                            "fail_on_missing_model.$": "$.config.fail_on_missing_model"
+                          }
+                        },
+                        "ResultSelector": {
+                          "skipped.$": "$.Payload.skipped",
+                          "endpoint_arns.$": "$.Payload.endpoint_arns",
+                          "payload.$": "$.Payload"
+                        },
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "ResultPath": "$.endpoint_setup",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "LoadRawCustomerSat",
+                    "States": {
+                      "LoadRawCustomerSat": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                        "Parameters": {
+                          "JobName": "${ComprehendGlueJobName}",
+                          "Arguments": {
+                            "--RUN_ID.$": "$.config.run_id",
+                            "--LOAD_MODE.$": "$.load_mode",
+                            "--SOURCE_BUCKET.$": "$.config.source_bucket",
+                            "--SOURCE_PREFIX.$": "$.config.source_prefix",
+                            "--DEST_BUCKET.$": "$.config.dest_bucket",
+                            "--DEST_PREFIX.$": "$.config.dest_prefix",
+                            "--PRIMARY_OUTPUT_FILE.$": "$.config.primary_output_file",
+                            "--MANIFEST_KEY.$": "$.config.manifest_key",
+                            "--PII_TEXT_COLS.$": "$.config.pii_text_column",
+                            "--DATES.$": "States.JsonToString($.dates)"
+                          }
+                        },
+                        "ResultPath": "$.raw_data_load_result",
+                        "End": true
+                      }
+                    }
+                  }
+                ],
+                "ResultSelector": {
+                  "endpoint_setup.$": "$[0].endpoint_setup",
+                  "raw_data_load_result.$": "$[1].raw_data_load_result"
+                },
+                "ResultPath": "$.prep",
+                "Next": "SelectSourceEndpoint"
+              },
+              "SelectSourceEndpoint": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Or": [
+                      {"Variable": "$.config.source_system", "StringEquals": "sms_web_relational"},
+                      {"Variable": "$.config.source_system", "StringEquals": "sms_web_transactional"}
+                    ],
+                    "Next": "SetSmsWebSourceEndpoint"
+                  }
+                ],
+                "Default": "SetIvrSourceEndpoint"
+              },
+              "SetSmsWebSourceEndpoint": {
+                "Type": "Pass",
+                "Parameters": {
+                  "level2_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.level2_sms_web",
+                  "level3_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.level3_sms_web",
+                  "level4_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.level4_sms_web"
+                },
+                "ResultPath": "$.selected_source_endpoint",
+                "Next": "CheckRawLoadStatus"
+              },
+              "SetIvrSourceEndpoint": {
+                "Type": "Pass",
+                "Parameters": {
+                  "level2_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.level2",
+                  "level3_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.level3",
+                  "level4_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.level4"
+                },
+                "ResultPath": "$.selected_source_endpoint",
+                "Next": "CheckRawLoadStatus"
+              },
+              "CheckRawLoadStatus": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendRawStatusCheckFunctionName}",
+                  "Payload": {
+                    "bucket.$": "$.config.bucket",
+                    "manifest_key.$": "$.config.manifest_key",
+                    "dest_prefix.$": "$.config.dest_prefix",
+                    "run_id.$": "$.config.run_id"
+                  }
+                },
+                "ResultSelector": {
+                  "instruction.$": "$.Payload.instruction",
+                  "reason.$": "$.Payload.reason",
+                  "message.$": "$.Payload.message",
+                  "manifest_status.$": "$.Payload.manifest_status",
+                  "selected_date_count.$": "$.Payload.selected_date_count",
+                  "selected_dates.$": "$.Payload.selected_dates",
+                  "primary_dataset_key.$": "$.Payload.primary_dataset_key",
+                  "primary_dataset_s3_uri.$": "$.Payload.primary_dataset_s3_uri",
+                  "run_specific_output_key.$": "$.Payload.run_specific_output_key",
+                  "run_specific_output_s3_uri.$": "$.Payload.run_specific_output_s3_uri"
+                },
+                "ResultPath": "$.raw_load_status_check",
+                "Next": "ShouldSkipRawProcessing"
+              },
+              "ShouldSkipRawProcessing": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.raw_load_status_check.instruction",
+                    "StringEquals": "SKIP",
+                    "Next": "CorrectedDashboardOutput"
+                  }
+                ],
+                "Default": "CleanPrep"
+              },
+              "CleanPrep": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendCleanTempFunctionName}",
+                  "Payload": {
+                    "task": "clean_prep",
+                    "run_id.$": "$.config.run_id",
+                    "raw_data_s3_prefix.$": "$.config.raw_data_s3_prefix",
+                    "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                    "input_format.$": "$.config.input_format",
+                    "text_column.$": "$.config.text_column",
+                    "fallback_text_column.$": "$.config.fallback_text_column",
+                    "record_id_column.$": "$.config.record_id_column",
+                    "source_system.$": "$.config.source_system",
+                    "metadata_columns.$": "$.config.metadata_columns",
+                    "max_records.$": "$.config.max_records",
+                    "translation_enabled.$": "$.config.translation_enabled",
+                    "language_column.$": "$.config.language_column",
+                    "event_date_column.$": "$.config.event_date_column",
+                    "translation_source_language.$": "$.config.translation_source_language",
+                    "translation_target_language.$": "$.config.translation_target_language",
+                    "pii_column.$": "$.config.pii_column"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.clean_prep_result",
+                "Next": "RunInferenceInParallel"
+              },
+              "RunInferenceInParallel": {
+                "Type": "Parallel",
+                "Branches": [
+                  {
+                    "StartAt": "SentimentAnalysis",
+                    "States": {
+                      "SentimentAnalysis": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendSentimentFunctionName}",
+                          "Payload": {
+                            "task": "sentiment_analysis",
+                            "run_id.$": "$.config.run_id",
+                            "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                            "input_cleaned_jsonl_s3_uri.$": "$.clean_prep_result.body.cleaned_records_s3_uri",
+                            "sentiment_mode.$": "$.config.sentiment_mode",
+                            "language_code.$": "$.config.language_code",
+                            "text_field.$": "$.config.text_field",
+                            "record_id_field.$": "$.config.record_id_field",
+                            "oversize_strategy.$": "$.config.oversize_strategy",
+                            "max_records.$": "$.config.max_records",
+                            "include_mixed.$": "$.config.include_mixed"
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.Payload.statusCode",
+                          "body.$": "States.StringToJson($.Payload.body)"
+                        },
+                        "ResultPath": "$.sentiment_result",
+                        "OutputPath": "$.sentiment_result",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Level2Classification",
+                    "States": {
+                      "Level2Classification": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendLevel2FunctionName}",
+                          "Payload": {
+                            "task": "level2_classification",
+                            "run_id.$": "$.config.run_id",
+                            "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                            "input_cleaned_jsonl_s3_uri.$": "$.clean_prep_result.body.cleaned_records_s3_uri",
+                            "level2_classifier_mode.$": "$.config.level2_classifier_mode",
+                            "level2_endpoint_arn.$": "$.selected_source_endpoint.level2_endpoint_arn",
+                            "level2": {
+                              "text_field.$": "$.config.text_field",
+                              "record_id_field.$": "$.config.record_id_field",
+                              "max_records.$": "$.config.max_records"
+                            }
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.Payload.statusCode",
+                          "body.$": "States.StringToJson($.Payload.body)"
+                        },
+                        "ResultPath": "$.level2_result",
+                        "OutputPath": "$.level2_result",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Level3Analysis",
+                    "States": {
+                      "Level3Analysis": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendLevel3FunctionName}",
+                          "Payload": {
+                            "task": "level3_analysis",
+                            "run_id.$": "$.config.run_id",
+                            "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                            "input_cleaned_jsonl_s3_uri.$": "$.clean_prep_result.body.cleaned_records_s3_uri",
+                            "level3_classifier_mode.$": "$.config.level3_classifier_mode",
+                            "level3_endpoint_arn.$": "$.selected_source_endpoint.level3_endpoint_arn",
+                            "level3_confidence_threshold.$": "$.config.level3_confidence_threshold",
+                            "verbose": false
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.Payload.statusCode",
+                          "body.$": "States.StringToJson($.Payload.body)"
+                        },
+                        "ResultPath": "$.level3_result",
+                        "OutputPath": "$.level3_result",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Level4Routing",
+                    "States": {
+                      "Level4Routing": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendLevel4FunctionName}",
+                          "Payload": {
+                            "task": "level4_routing",
+                            "run_id.$": "$.config.run_id",
+                            "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                            "input_cleaned_jsonl_s3_uri.$": "$.clean_prep_result.body.cleaned_records_s3_uri",
+                            "level4_classifier_mode.$": "$.config.level4_classifier_mode",
+                            "level4_endpoint_arn.$": "$.selected_source_endpoint.level4_endpoint_arn",
+                            "level4": {
+                              "text_field.$": "$.config.text_field",
+                              "record_id_field.$": "$.config.record_id_field",
+                              "max_records.$": "$.config.max_records"
+                            }
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.Payload.statusCode",
+                          "body.$": "States.StringToJson($.Payload.body)"
+                        },
+                        "ResultPath": "$.level4_result",
+                        "OutputPath": "$.level4_result",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "UrgentDetection",
+                    "States": {
+                      "UrgentDetection": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendUrgentFunctionName}",
+                          "Payload": {
+                            "task": "urgent",
+                            "run_id.$": "$.config.run_id",
+                            "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                            "input_cleaned_jsonl_s3_uri.$": "$.clean_prep_result.body.cleaned_records_s3_uri",
+                            "urgent_classifier_mode.$": "$.config.urgent_classifier_mode",
+                            "urgent_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.urgent",
+                            "urgent": {
+                              "text_field.$": "$.config.text_field",
+                              "record_id_field.$": "$.config.record_id_field",
+                              "max_records.$": "$.config.max_records"
+                            }
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.Payload.statusCode",
+                          "body.$": "States.StringToJson($.Payload.body)"
+                        },
+                        "ResultPath": "$.urgent_result",
+                        "OutputPath": "$.urgent_result",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "ActionableDetection",
+                    "States": {
+                      "ActionableDetection": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendActionableFunctionName}",
+                          "Payload": {
+                            "task": "actionable",
+                            "run_id.$": "$.config.run_id",
+                            "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                            "input_cleaned_jsonl_s3_uri.$": "$.clean_prep_result.body.cleaned_records_s3_uri",
+                            "actionable_classifier_mode.$": "$.config.actionable_classifier_mode",
+                            "actionable_endpoint_arn.$": "$.prep.endpoint_setup.endpoint_arns.actionable",
+                            "actionable": {
+                              "text_field.$": "$.config.text_field",
+                              "record_id_field.$": "$.config.record_id_field",
+                              "max_records.$": "$.config.max_records"
+                            }
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.Payload.statusCode",
+                          "body.$": "States.StringToJson($.Payload.body)"
+                        },
+                        "ResultPath": "$.actionable_result",
+                        "OutputPath": "$.actionable_result",
+                        "End": true
+                      }
+                    }
+                  }
+                ],
+                "ResultSelector": {
+                  "sentiment_result.$": "$[0]",
+                  "level2_result.$": "$[1]",
+                  "level3_result.$": "$[2]",
+                  "level4_result.$": "$[3]",
+                  "urgent_result.$": "$[4]",
+                  "actionable_result.$": "$[5]"
+                },
+                "ResultPath": "$.inference_results",
+                "Next": "FinalRunOutput"
+              },
+              "FinalRunOutput": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendFinalOutputFunctionName}",
+                  "Payload": {
+                    "task": "final_output",
+                    "load_mode.$": "$.load_mode",
+                    "bucket.$": "$.config.bucket",
+                    "run_id.$": "$.config.run_id",
+                    "source_system.$": "$.config.source_system",
+                    "runs_s3_prefix.$": "$.config.runs_s3_prefix",
+                    "raw_data_s3_prefix.$": "$.config.raw_data_s3_prefix",
+                    "raw_input_format.$": "$.config.input_format",
+                    "raw_record_id_column.$": "$.config.record_id_column",
+                    "pipeline_record_id_column.$": "$.config.record_id_field",
+                    "level2_classifier_mode.$": "$.config.level2_classifier_mode",
+                    "level3_classifier_mode.$": "$.config.level2_classifier_mode",
+                    "level4_classifier_mode.$": "$.config.level3_classifier_mode",
+                    "urgent_classifier_mode.$": "$.config.level4_classifier_mode",
+                    "actionable_classifier_mode.$": "$.config.actionable_classifier_mode"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.final_output_result",
+                "Next": "CorrectedDashboardOutput"
+              },
+              "CorrectedDashboardOutput": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendCorrectedOutputFunctionName}",
+                  "Payload": {
+                    "bucket.$": "$.config.bucket",
+                    "base_prefix.$": "$.config.base_prefix",
+                    "run_id.$": "$.config.run_id",
+                    "source_system.$": "$.config.source_system",
+                    "load_mode.$": "$.load_mode",
+                    "update_rds.$": "$.update_rds",
+                    "update_dlportal.$": "$.config.update_dlportal",
+                    "dlportal_source_tables.$": "$.config.dlportal_source_tables",
+                    "dlportal_target_table.$": "$.config.dlportal_target_table",
+                    "update_corrected_file.$": "$.config.update_corrected_file",
+                    "dlportal_corrected_table.$": "$.config.dlportal_corrected_table"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "bucket.$": "$.Payload.bucket",
+                  "run_id.$": "$.Payload.run_id",
+                  "trimmed_dashboard_output.$": "$.Payload.trimmed_dashboard_output",
+                  "all_columns_dashboard_output.$": "$.Payload.all_columns_dashboard_output",
+                  "trimmed_records_replaced.$": "$.Payload.trimmed_records_replaced",
+                  "all_columns_updated_column_count.$": "$.Payload.all_columns_records_updated",
+                  "rds_result.$": "$.Payload.rds_result"
+                },
+                "ResultPath": "$.corrected_dashboard_output_result",
+                "Next": "DeleteComprehendEndpoints"
+              },
+              "DeleteComprehendEndpoints": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendDeleteEndpointsFunctionName}",
+                  "Payload": {
+                    "run_id.$": "$.config.run_id",
+                    "source_system.$": "$.config.source_system",
+                    "delete_endpoints.$": "$.delete_endpoints",
+                    "training_bucket.$": "$.config.training_bucket",
+                    "endpoint_arns.$": "$.prep.endpoint_setup.endpoint_arns",
+                    "models.$": "$.config.models",
+                    "wait_for_deleted.$": "$.config.wait_for_deleted",
+                    "fail_on_delete_error.$": "$.config.fail_on_delete_error"
+                  }
+                },
+                "ResultSelector": {
+                  "delete_endpoints.$": "$.Payload.delete_endpoints",
+                  "deleted_requested_count.$": "$.Payload.deleted_requested_count",
+                  "failed_count.$": "$.Payload.failed_count",
+                  "results.$": "$.Payload.results",
+                  "skipped.$": "$.Payload.skipped"
+                },
+                "ResultPath": "$.delete_endpoints_result",
+                "Next": "TriggerBedrockPipeline"
+              },
+              "TriggerBedrockPipeline": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution",
+                "Parameters": {
+                  "StateMachineArn": "${BedrockPipelineArn}",
+                  "Input": {
+                    "run_id.$": "$.config.run_id",
+                    "source_system.$": "$.config.source_system",
+                    "bedrock_prep_mode.$": "$.config.bedrock_prep_mode",
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                  }
+                },
+                "ResultPath": "$.trigger_bedrock_result",
+                "End": true
+              }
+            }
+          }
+        - CuratedBucketName: !Ref CuratedBucketName
+          TempBucketName: !Ref TempBucketName
+          ArtifactBucket: !Ref ArtifactBucket
+          ComprehendDataAccessRoleArn: !Ref ComprehendDataAccessRoleArn
+          ComprehendCreateEndpointsFunctionName: !Ref ComprehendCreateEndpointsLambda
+          ComprehendGlueJobName: !Ref ComprehendGlueJob
+          ComprehendRawStatusCheckFunctionName: !Ref ComprehendRawStatusCheckLambda
+          ComprehendCleanTempFunctionName: !Ref ComprehendCleanTempLambda
+          ComprehendSentimentFunctionName: !Ref ComprehendSentimentLambda
+          ComprehendLevel2FunctionName: !Ref ComprehendLevel2Lambda
+          ComprehendLevel3FunctionName: !Ref ComprehendLevel3Lambda
+          ComprehendLevel4FunctionName: !Ref ComprehendLevel4Lambda
+          ComprehendUrgentFunctionName: !Ref ComprehendUrgentLambda
+          ComprehendActionableFunctionName: !Ref ComprehendActionableLambda
+          ComprehendFinalOutputFunctionName: !Ref ComprehendFinalOutputLambda
+          ComprehendCorrectedOutputFunctionName: !Ref ComprehendCorrectedOutputLambda
+          ComprehendDeleteEndpointsFunctionName: !Ref ComprehendDeleteEndpointsLambda
+          BedrockPipelineArn: !Sub
+            - "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:datalake-bedrock-pipeline-temp-${Suffix}"
+            - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+
+  SurveyMonitorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub
+        - "datalake-sentiment-analysis-survey-monitor-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StepFunctionExecutionRoleName}"
+      StateMachineType: STANDARD
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Sentiment Glue Job -> Comprehend Pipeline (sequential), with unified failure notification",
+            "StartAt": "StartSentimentGlueJob",
+            "States": {
+              "StartSentimentGlueJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {
+                  "JobName": "${SentimentGlueJobName}",
+                  "Arguments": {
+                    "--mode": "auto"
+                  }
+                },
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckSentimentStatus"
+              },
+              "CheckSentimentStatus": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.JobRunState",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "GetSourceAvailability"
+                  }
+                ],
+                "Default": "NotifyFailure"
+              },
+              "GetSourceAvailability": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${GetAvailabilityFunctionName}",
+                  "Payload": {}
+                },
+                "ResultPath": "$.availability_result",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckSMSRelationalAvailability"
+              },
+              "CheckSMSRelationalAvailability": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "And": [
+                      {"Variable": "$.availability_result.Payload.sms_web_relational_available", "IsPresent": true},
+                      {"Variable": "$.availability_result.Payload.sms_web_relational_available", "BooleanEquals": true}
+                    ],
+                    "Next": "StartComprehendJob_SMSRelational"
+                  }
+                ],
+                "Default": "CheckSMSTransactionalAvailability"
+              },
+              "StartComprehendJob_SMSRelational": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                "Parameters": {
+                  "StateMachineArn": "${ComprehendPipelineArn}",
+                  "Input": {
+                    "load_mode": "APPEND_MISSING",
+                    "dates": [],
+                    "update_rds": true,
+                    "create_endpoints": true,
+                    "delete_endpoints": false,
+                    "source": "sms_web_relational",
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                  }
+                },
+                "ResultPath": "$.comprehend_pipeline_result",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckComprehendStatus_SMSRelational"
+              },
+              "CheckComprehendStatus_SMSRelational": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.comprehend_pipeline_result.Status",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "CheckSMSTransactionalAvailability"
+                  }
+                ],
+                "Default": "NotifyFailure"
+              },
+              "CheckSMSTransactionalAvailability": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "And": [
+                      {"Variable": "$.availability_result.Payload.sms_web_transactional_available", "IsPresent": true},
+                      {"Variable": "$.availability_result.Payload.sms_web_transactional_available", "BooleanEquals": true}
+                    ],
+                    "Next": "StartComprehendJob_SMSTransactional"
+                  }
+                ],
+                "Default": "CheckAPITransactionalAvailability"
+              },
+              "StartComprehendJob_SMSTransactional": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                "Parameters": {
+                  "StateMachineArn": "${ComprehendPipelineArn}",
+                  "Input": {
+                    "load_mode": "APPEND_MISSING",
+                    "dates": [],
+                    "update_rds": true,
+                    "create_endpoints": true,
+                    "delete_endpoints": false,
+                    "source": "sms_web_transactional",
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                  }
+                },
+                "ResultPath": "$.comprehend_pipeline_result",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckComprehendStatus_SMSTransactional"
+              },
+              "CheckComprehendStatus_SMSTransactional": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.comprehend_pipeline_result.Status",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "CheckAPITransactionalAvailability"
+                  }
+                ],
+                "Default": "NotifyFailure"
+              },
+              "CheckAPITransactionalAvailability": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "And": [
+                      {"Variable": "$.availability_result.Payload.api_web_transactional_available", "IsPresent": true},
+                      {"Variable": "$.availability_result.Payload.api_web_transactional_available", "BooleanEquals": true}
+                    ],
+                    "Next": "StartComprehendJob_APITransactional"
+                  }
+                ],
+                "Default": "CheckAPIRelationalAvailability"
+              },
+              "StartComprehendJob_APITransactional": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                "Parameters": {
+                  "StateMachineArn": "${ComprehendPipelineArn}",
+                  "Input": {
+                    "load_mode": "APPEND_MISSING",
+                    "dates": [],
+                    "update_rds": true,
+                    "create_endpoints": true,
+                    "delete_endpoints": false,
+                    "source": "api_web_transactional",
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                  }
+                },
+                "ResultPath": "$.comprehend_pipeline_result",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckComprehendStatus_APITransactional"
+              },
+              "CheckComprehendStatus_APITransactional": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.comprehend_pipeline_result.Status",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "CheckAPIRelationalAvailability"
+                  }
+                ],
+                "Default": "NotifyFailure"
+              },
+              "CheckAPIRelationalAvailability": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "And": [
+                      {"Variable": "$.availability_result.Payload.api_web_relational_available", "IsPresent": true},
+                      {"Variable": "$.availability_result.Payload.api_web_relational_available", "BooleanEquals": true}
+                    ],
+                    "Next": "StartComprehendJob_APIRelational"
+                  }
+                ],
+                "Default": "StartComprehendJob_IVR"
+              },
+              "StartComprehendJob_APIRelational": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                "Parameters": {
+                  "StateMachineArn": "${ComprehendPipelineArn}",
+                  "Input": {
+                    "load_mode": "APPEND_MISSING",
+                    "dates": [],
+                    "update_rds": true,
+                    "create_endpoints": true,
+                    "delete_endpoints": false,
+                    "source": "api_web_relational",
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                  }
+                },
+                "ResultPath": "$.comprehend_pipeline_result",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckComprehendStatus_APIRelational"
+              },
+              "CheckComprehendStatus_APIRelational": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.comprehend_pipeline_result.Status",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "StartComprehendJob_IVR"
+                  }
+                ],
+                "Default": "NotifyFailure"
+              },
+              "StartComprehendJob_IVR": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                "Parameters": {
+                  "StateMachineArn": "${ComprehendPipelineArn}",
+                  "Input": {
+                    "load_mode": "APPEND_MISSING",
+                    "dates": [],
+                    "update_rds": true,
+                    "create_endpoints": true,
+                    "delete_endpoints": true,
+                    "source": "ivr",
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                  }
+                },
+                "ResultPath": "$.comprehend_pipeline_result",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckComprehendStatus_IVR"
+              },
+              "CheckComprehendStatus_IVR": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.comprehend_pipeline_result.Status",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "StartReconciliationGlueJob"
+                  }
+                ],
+                "Default": "NotifyFailure"
+              },
+              "StartReconciliationGlueJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {
+                  "JobName": "datalake-ccaas-reconciliation-report-dev",
+                  "Arguments": {
+                    "--ENV": "dev",
+                    "--EVENT_DATES_S3_PATH": "s3://psegli-datalakenonprodli-datalake-temp-dev/ccaas/event_dates/survey_api_json/event_dates.json",
+                    "--conf": "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true"
+                  }
+                },
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ],
+                "Next": "CheckReconciliationStatus"
+              },
+              "CheckReconciliationStatus": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.JobRunState",
+                    "StringEquals": "SUCCEEDED",
+                    "Next": "Success"
+                  }
+                ],
+                "Default": "NotifyFailure"
+              },
+              "NotifyFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${AlertsTopicArn}",
+                  "Subject": "ALERT: Sentiment/Curation/Comprehend Pipeline Failure",
+                  "Message": "A step in the sentiment/curation/comprehend pipeline FAILED in ${EnvLabel}. Check the Step Functions execution history for details."
+                },
+                "Next": "Fail"
+              },
+              "Fail": {
+                "Type": "Fail",
+                "Error": "PipelineExecutionFailed",
+                "Cause": "One or more steps in the sentiment/curation/comprehend pipeline failed. See NotifyFailure SNS alert and execution history for details."
+              },
+              "Success": {
+                "Type": "Succeed"
+              }
+            }
+          }
+        - SentimentGlueJobName: !Ref SentimentAnalysisGlueJob
+          GetAvailabilityFunctionName: !Ref SentimentAnalysisGetAvailabilityLambda
+          ComprehendPipelineArn: !GetAtt ComprehendPipelineStateMachine.Arn
+          AlertsTopicArn: !Ref SentimentAlertsTopic
+          EnvLabel: !Ref DeployEnv
+
+  # --- EventBridge: triggers the parent Step Function when the ccaas survey-monitor
+  # Step Function (a DIFFERENT, separately-managed stack - datalake-ccaas-sdap-survey-monitor)
+  # completes successfully. Event pattern confirmed via console screenshot of the
+  # live rule. CONFIRMED: the ccaas pipeline has its own separate CloudFormation
+  # stack and is dev-only by design - it will never have a staging deployment.
+  # So the trigger source (ccaas survey-monitor ARN) is intentionally pinned to
+  # "-dev" regardless of THIS stack's DeployEnv - a staging deploy of this
+  # sentiment-analysis pipeline still listens for the one real (dev) ccaas
+  # execution, since that's the only one that will ever exist.
+
+  SentimentAnalysisSurveyTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub
+        - "datalake-sentiment-analysis-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      EventBusName: default
+      State: ENABLED
+      EventPattern:
+        source:
+          - "aws.states"
+        detail-type:
+          - "Step Functions Execution Status Change"
+        detail:
+          status:
+            - "SUCCEEDED"
+          stateMachineArn:
+            - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:datalake-ccaas-sdap-survey-monitor-dev"
+      Targets:
+        - Id: SentimentAnalysisSurveyMonitorTarget
+          Arn: !Ref SurveyMonitorStateMachine
+          RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${EventBridgeToStepFunctionsRoleName}"
+
+Outputs:
+
+  SentimentAlertsTopicArn:
+    Description: "ARN of the SNS topic used for sentiment analysis pipeline failure alerts."
+    Value: !Ref SentimentAlertsTopic
+
+  SentimentAnalysisTrackerTableName:
+    Description: "Name of the DynamoDB table read by the get-availability Lambda."
+    Value: !Ref SentimentAnalysisTrackerTable
+
+  SentimentAnalysisGlueJobName:
+    Description: "Name of the sentiment analysis Glue job."
+    Value: !Ref SentimentAnalysisGlueJob
+
+  SentimentAnalysisCurationGlueJobName:
+    Description: "Name of the sentiment analysis curation Glue job."
+    Value: !Ref SentimentAnalysisCurationGlueJob
+
+  ComprehendGlueJobName:
+    Description: "Name of the comprehend raw-data-load Glue job."
+    Value: !Ref ComprehendGlueJob
+
+  ComprehendActionableLambdaName:
+    Description: "Name of the datalake-comprehend-actionable Lambda function."
+    Value: !Ref ComprehendActionableLambda
+
+  ComprehendCleanTempLambdaName:
+    Description: "Name of the datalake-comprehend-clean-temp Lambda function."
+    Value: !Ref ComprehendCleanTempLambda
+
+  ComprehendCorrectedOutputLambdaName:
+    Description: "Name of the datalake-comprehend-corrected-output Lambda function."
+    Value: !Ref ComprehendCorrectedOutputLambda
+
+  ComprehendCreateEndpointsLambdaName:
+    Description: "Name of the datalake-comprehend-create-endpoints Lambda function."
+    Value: !Ref ComprehendCreateEndpointsLambda
+
+  ComprehendDeleteEndpointsLambdaName:
+    Description: "Name of the datalake-comprehend-delete-endpoints Lambda function."
+    Value: !Ref ComprehendDeleteEndpointsLambda
+
+  ComprehendFinalOutputLambdaName:
+    Description: "Name of the datalake-comprehend-final-output Lambda function."
+    Value: !Ref ComprehendFinalOutputLambda
+
+  ComprehendLevel2LambdaName:
+    Description: "Name of the datalake-comprehend-level2 Lambda function."
+    Value: !Ref ComprehendLevel2Lambda
+
+  ComprehendLevel3LambdaName:
+    Description: "Name of the datalake-comprehend-level3 Lambda function."
+    Value: !Ref ComprehendLevel3Lambda
+
+  ComprehendLevel4LambdaName:
+    Description: "Name of the datalake-comprehend-level4 Lambda function."
+    Value: !Ref ComprehendLevel4Lambda
+
+  ComprehendRawStatusCheckLambdaName:
+    Description: "Name of the datalake-comprehend-raw-status-check Lambda function."
+    Value: !Ref ComprehendRawStatusCheckLambda
+
+  ComprehendSentimentLambdaName:
+    Description: "Name of the datalake-comprehend-sentiment Lambda function."
+    Value: !Ref ComprehendSentimentLambda
+
+  ComprehendUrgentLambdaName:
+    Description: "Name of the datalake-comprehend-urgent Lambda function."
+    Value: !Ref ComprehendUrgentLambda
+
+  SentimentAnalysisGetAvailabilityLambdaName:
+    Description: "Name of the datalake-sentiment-analysis-get-availability Lambda function."
+    Value: !Ref SentimentAnalysisGetAvailabilityLambda
+
+  ComprehendPipelineStateMachineArn:
+    Description: "ARN of the child comprehend inference/endpoint-lifecycle Step Function."
+    Value: !GetAtt ComprehendPipelineStateMachine.Arn
+
+  SurveyMonitorStateMachineArn:
+    Description: "ARN of the parent survey-monitor Step Function (Glue -> Curation -> Comprehend orchestration)."
+    Value: !GetAtt SurveyMonitorStateMachine.Arn
+
+  SentimentAnalysisSurveyTriggerRuleArn:
+    Description: "ARN of the EventBridge rule that starts the parent Step Function when the ccaas survey-monitor succeeds."
+    Value: !GetAtt SentimentAnalysisSurveyTriggerRule.Arn

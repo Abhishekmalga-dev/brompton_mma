@@ -1,5 +1,5 @@
 {
-  "Comment": "Sentiment Glue Job -> Curation Glue Job -> Comprehend Pipeline (sequential), with unified failure notification",
+  "Comment": "Sentiment Glue Job -> Comprehend Pipeline (sequential, availability-gated) -> Reconciliation Report, with unified failure notification",
   "StartAt": "StartSentimentGlueJob",
   "States": {
     "StartSentimentGlueJob": {
@@ -21,35 +21,6 @@
       "Next": "CheckSentimentStatus"
     },
     "CheckSentimentStatus": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.JobRunState",
-          "StringEquals": "SUCCEEDED",
-          "Next": "StartCurationGlueJob"
-        }
-      ],
-      "Default": "NotifyFailure"
-    },
-    "StartCurationGlueJob": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::glue:startJobRun.sync",
-      "Parameters": {
-        "JobName": "datalake-sentiment-analysis-curation-dev",
-        "Arguments": {
-          "--mode": "auto"
-        }
-      },
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "NotifyFailure"
-        }
-      ],
-      "Next": "CheckCurationStatus"
-    },
-    "CheckCurationStatus": {
       "Type": "Choice",
       "Choices": [
         {

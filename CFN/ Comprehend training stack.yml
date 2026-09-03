@@ -1,0 +1,804 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Comprehend Model Training/Eval Pipeline - separate stack from the daily-use
+  sentiment analysis pipeline (sentiment_analysis_stack.yml) so this can be
+  modified/redeployed independently. Triggered fire-and-forget (no .sync, no
+  Catch) by the daily pipeline's TriggerTrainingEval state, which passes
+  run_id/train_mode/test_mode/data_access_role_arn as execution Input - none
+  of those are CloudFormation Parameters here, they arrive at runtime.
+
+Parameters:
+
+  DeployEnv:
+    Type: String
+    Description: "Deployment environment. dev and staging both deploy into the nonprod AWS account as fully independent, parallel stacks."
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  # --- Existing S3 buckets (NOT created by this template) ---
+
+  ArtifactBucket:
+    Type: String
+    Description: "Existing S3 bucket where CI/CD uploads this pipeline's Lambda zips."
+    Default: psegli-datalakenonprodli-datalake-build-dev
+
+  TempBucketName:
+    Type: String
+    Description: "Existing S3 bucket used for training data (Sentiment_Analysis/training_data/...). Shared/pinned, not replicated per DeployEnv - same bucket the daily pipeline uses."
+    Default: psegli-datalakenonprodli-datalake-temp-dev
+
+  # --- Existing shared IAM roles (NOT created by this template) ---
+  # PLACEHOLDER - flagged as the LAST open item, per explicit instruction:
+  # user will confirm whether Comprehend training Lambdas need
+  # broader/different IAM permissions (e.g. comprehend:CreateDocumentClassifier)
+  # than the daily-pipeline's shared roles. Using the SAME shared roles as a
+  # starting assumption - do not treat as final until confirmed.
+
+  LambdaExecutionRoleName:
+    Type: String
+    Description: "PLACEHOLDER - pending confirmation. Existing shared IAM role name for Lambda execution."
+    Default: Lambda-execution-datalake-dev
+
+  StepFunctionExecutionRoleName:
+    Type: String
+    Description: "PLACEHOLDER - pending confirmation. Existing shared IAM role name for Step Functions execution."
+    Default: stepfunction-execution-datalake-dev
+
+  # --- Versioning / artifacts ---
+
+  CodeVersion:
+    Type: String
+    Description: "Short git SHA or version identifier for artifacts, matching the CI/CD packaging convention."
+    Default: latest
+
+  TrainingArtifactPrefix:
+    Type: String
+    Description: "S3 key prefix (within ArtifactBucket) where CI/CD uploads this pipeline's Lambda zips. Proposed default - please confirm or correct, not yet screenshot-confirmed like sentiment-artifact was."
+    Default: training-artifact
+
+Conditions:
+
+  IsProd: !Equals [!Ref DeployEnv, "prod"]
+
+Mappings:
+  # Same shape as the daily-pipeline template, kept consistent even though
+  # StagingArg has no consumer here today (no Glue jobs in this pipeline) -
+  # ResourceSuffix is the one actually used, for every resource name below.
+  EnvConfig:
+    dev:
+      AccountTier: nonprod
+      StagingArg: "dev"
+      ResourceSuffix: "dev"
+    staging:
+      AccountTier: nonprod
+      StagingArg: "staging"
+      ResourceSuffix: "staging-dev"
+    prod:
+      AccountTier: prod
+      StagingArg: "dev"
+      ResourceSuffix: "prod"
+
+Resources:
+
+  # --- Lambda Functions (11 total) ---
+  # Runtime/Timeout/MemorySize/EphemeralStorage confirmed same as the daily
+  # pipeline's 13 Lambdas. Handler convention (python.<filename>.lambda_handler)
+  # assumed consistent with the same repo's folder structure.
+
+  ComprehendTrainActionableLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-actionable-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-actionable.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-actionable_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainFinalOutputLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-final-output-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-final-output.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-final-output_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainGateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-gate-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-gate.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-gate_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainLevel2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-level2-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-level2.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-level2_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainLevel3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-level3-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-level3.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-level3_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainLevel3ClassifierLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-level3-classifier-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-level3-classifier.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-level3-classifier_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainLevel4Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-level4-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-level4.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-level4_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainUpdateBaselineLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-update-baseline-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-update-baseline.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-update-baseline_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainUrgentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-urgent-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-urgent.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-urgent_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendTrainValidateOutputLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-train-validate-output-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-train-validate-output.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-train-validate-output_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  ComprehendUpdateTrainDataLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-comprehend-update-train-data-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-comprehend-update-train-data.lambda_handler
+      Runtime: python3.13
+      Timeout: 421
+      MemorySize: 10240
+      EphemeralStorage:
+        Size: 10240
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${TrainingArtifactPrefix}/datalake-comprehend-update-train-data_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  # --- Step Function ---
+  # IMPORTANT: this name MUST exactly match what the daily pipeline's
+  # sentiment_analysis_stack.yml TrainingPipelineArn already assumes:
+  # "datalake-comprehend-training-temp-${ResourceSuffix}".
+
+  ComprehendTrainingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub
+        - "datalake-comprehend-training-temp-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StepFunctionExecutionRoleName}"
+      StateMachineType: STANDARD
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Comprehend training workflow: update training data first, train models in parallel, then write final training summary output.",
+            "StartAt": "GenerateRuntimeParts",
+            "States": {
+              "GenerateRuntimeParts": {
+                "Type": "Pass",
+                "Parameters": {
+                  "execution_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
+                  "execution_time_raw.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 1)"
+                },
+                "ResultPath": "$.runtime_parts",
+                "Next": "SplitRuntimeTime"
+              },
+              "SplitRuntimeTime": {
+                "Type": "Pass",
+                "Parameters": {
+                  "execution_date.$": "$.runtime_parts.execution_date",
+                  "time_parts.$": "States.StringSplit($.runtime_parts.execution_time_raw, '.:Z')"
+                },
+                "ResultPath": "$.runtime_parts",
+                "Next": "GeneratePipelineConfig"
+              },
+              "GeneratePipelineConfig": {
+                "Type": "Pass",
+                "Parameters": {
+                  "run_id.$": "States.Format('step-training-{}-{}-{}-{}', $.runtime_parts.execution_date, States.ArrayGetItem($.runtime_parts.time_parts, 1), States.ArrayGetItem($.runtime_parts.time_parts, 0), States.ArrayGetItem($.runtime_parts.time_parts, 2))",
+                  "train_mode.$": "$.train_mode",
+                  "test_mode.$": "$.test_mode",
+                  "include_synthetic_training": {
+                    "level2": true,
+                    "level3": true,
+                    "level4": true,
+                    "actionable": false,
+                    "urgent": false
+                  },
+                  "data_access_role_arn.$": "$.data_access_role_arn",
+                  "level2_mode": "train",
+                  "level3_mode": "train",
+                  "level4_mode": "train",
+                  "actionable_mode": "train",
+                  "urgent_mode": "train",
+                  "level2_classifier_name": "level2-custom-classifier",
+                  "level3_classifier_name": "level3-custom-classifier",
+                  "level4_classifier_name": "level4-custom-classifier",
+                  "actionable_classifier_name": "actionable-custom-classifier",
+                  "urgent_classifier_name": "urgent-custom-classifier"
+                },
+                "ResultPath": "$.config",
+                "Next": "UpdateTrainingData"
+              },
+              "UpdateTrainingData": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${UpdateTrainDataFunctionName}",
+                  "Payload": {
+                    "bucket": "${TempBucketName}",
+                    "training_key": "Sentiment_Analysis/training_data/comprehend_training_with_headers.csv",
+                    "corrected_key": "Sentiment_Analysis/training_data/corrected_final_output.csv",
+                    "merged_output_key": "Sentiment_Analysis/training_data/comprehend_training_with_headers_merged.csv",
+                    "test_mode.$": "$.config.test_mode",
+                    "include_synthetic_training.$": "$.config.include_synthetic_training",
+                    "min_text_length": 3,
+                    "level2_classifier_name.$": "$.config.level2_classifier_name",
+                    "level3_classifier_name.$": "$.config.level3_classifier_name",
+                    "level4_classifier_name.$": "$.config.level4_classifier_name",
+                    "urgent_classifier_name.$": "$.config.urgent_classifier_name",
+                    "actionable_classifier_name.$": "$.config.actionable_classifier_name"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.StatusCode",
+                  "payload.$": "$.Payload"
+                },
+                "ResultPath": "$.update_training_data_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "CheckTrainingGate"
+              },
+              "CheckTrainingGate": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendTrainGateFunctionName}",
+                  "Payload": {
+                    "train_mode.$": "$.config.train_mode",
+                    "training_bucket": "${TempBucketName}",
+                    "training_baseline_key": "Sentiment_Analysis/training_data/training_summaries/training_record_baseline.json",
+                    "corrected_final_output_key": "Sentiment_Analysis/training_data/corrected_final_output.csv",
+                    "min_new_records_for_training": 100
+                  }
+                },
+                "ResultSelector": {
+                  "should_train.$": "$.Payload.training_gate.should_train",
+                  "instruction.$": "$.Payload.training_gate.instruction",
+                  "current_record_count.$": "$.Payload.training_gate.current_record_count",
+                  "last_trained_record_count.$": "$.Payload.training_gate.last_trained_record_count",
+                  "new_records_since_training.$": "$.Payload.training_gate.new_records_since_training",
+                  "min_new_records_for_training.$": "$.Payload.training_gate.min_new_records_for_training",
+                  "checked_at.$": "$.Payload.training_gate.checked_at",
+                  "baseline_key.$": "$.Payload.training_gate.baseline_key",
+                  "corrected_final_output_key.$": "$.Payload.training_gate.corrected_final_output_key"
+                },
+                "ResultPath": "$.training_gate",
+                "Next": "ShouldTrainModels"
+              },
+              "ShouldTrainModels": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.training_gate.instruction",
+                    "StringEquals": "CONTINUE",
+                    "Next": "TrainModelsInParallel"
+                  }
+                ],
+                "Default": "SkipTraining"
+              },
+              "SkipTraining": {
+                "Type": "Succeed"
+              },
+              "TrainModelsInParallel": {
+                "Type": "Parallel",
+                "Branches": [
+                  {
+                    "StartAt": "TrainLevel2Classifier",
+                    "States": {
+                      "TrainLevel2Classifier": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendTrainLevel2FunctionName}",
+                          "Payload": {
+                            "mode.$": "$.config.level2_mode",
+                            "test_mode.$": "$.config.test_mode",
+                            "run_id.$": "$.config.run_id",
+                            "data_access_role_arn.$": "$.config.data_access_role_arn",
+                            "classifier_name.$": "$.config.level2_classifier_name",
+                            "version_name.$": "$.update_training_data_result.payload.latest_model_versions.level2_custom_classifier"
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.StatusCode",
+                          "payload.$": "$.Payload"
+                        },
+                        "ResultPath": "$.level2_training_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "TrainLevel3Discovery",
+                    "States": {
+                      "TrainLevel3Discovery": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendTrainLevel3FunctionName}",
+                          "Payload": {
+                            "run_id.$": "$.config.run_id",
+                            "mode.$": "$.config.level3_mode",
+                            "seed_training_s3_uri": "${TrainingSeedS3Uri}",
+                            "artifact_s3_uri": "${Level3ArtifactS3Uri}",
+                            "append_run_id": false,
+                            "verbose": true
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.StatusCode",
+                          "payload.$": "$.Payload"
+                        },
+                        "ResultPath": "$.level3_discovery_training_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "TrainLevel3Classifier",
+                    "States": {
+                      "TrainLevel3Classifier": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendTrainLevel3ClassifierFunctionName}",
+                          "Payload": {
+                            "mode.$": "$.config.level3_mode",
+                            "test_mode.$": "$.config.test_mode",
+                            "run_id.$": "$.config.run_id",
+                            "data_access_role_arn.$": "$.config.data_access_role_arn",
+                            "classifier_name.$": "$.config.level3_classifier_name",
+                            "version_name.$": "$.update_training_data_result.payload.latest_model_versions.level3_custom_classifier"
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.StatusCode",
+                          "payload.$": "$.Payload"
+                        },
+                        "ResultPath": "$.level3_classifier_training_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "TrainLevel4Classifier",
+                    "States": {
+                      "TrainLevel4Classifier": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendTrainLevel4FunctionName}",
+                          "Payload": {
+                            "mode.$": "$.config.level4_mode",
+                            "test_mode.$": "$.config.test_mode",
+                            "run_id.$": "$.config.run_id",
+                            "data_access_role_arn.$": "$.config.data_access_role_arn",
+                            "classifier_name.$": "$.config.level4_classifier_name",
+                            "version_name.$": "$.update_training_data_result.payload.latest_model_versions.level4_custom_classifier"
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.StatusCode",
+                          "payload.$": "$.Payload"
+                        },
+                        "ResultPath": "$.level4_training_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "TrainUrgentClassifier",
+                    "States": {
+                      "TrainUrgentClassifier": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendTrainUrgentFunctionName}",
+                          "Payload": {
+                            "mode.$": "$.config.urgent_mode",
+                            "test_mode.$": "$.config.test_mode",
+                            "run_id.$": "$.config.run_id",
+                            "data_access_role_arn.$": "$.config.data_access_role_arn",
+                            "classifier_name.$": "$.config.urgent_classifier_name",
+                            "version_name.$": "$.update_training_data_result.payload.latest_model_versions.urgent_custom_classifier"
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.StatusCode",
+                          "payload.$": "$.Payload"
+                        },
+                        "ResultPath": "$.urgent_training_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "TrainActionableClassifier",
+                    "States": {
+                      "TrainActionableClassifier": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${ComprehendTrainActionableFunctionName}",
+                          "Payload": {
+                            "mode.$": "$.config.actionable_mode",
+                            "test_mode.$": "$.config.test_mode",
+                            "run_id.$": "$.config.run_id",
+                            "data_access_role_arn.$": "$.config.data_access_role_arn",
+                            "classifier_name.$": "$.config.actionable_classifier_name",
+                            "version_name.$": "$.update_training_data_result.payload.latest_model_versions.actionable_custom_classifier"
+                          }
+                        },
+                        "ResultSelector": {
+                          "statusCode.$": "$.StatusCode",
+                          "payload.$": "$.Payload"
+                        },
+                        "ResultPath": "$.actionable_training_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  }
+                ],
+                "ResultPath": "$.parallel_training_results",
+                "Next": "ValidateTrainingResults"
+              },
+              "ValidateTrainingResults": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendTrainValidateOutputFunctionName}",
+                  "Payload.$": "$"
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.StatusCode",
+                  "payload.$": "$.Payload"
+                },
+                "ResultPath": "$.validate_training_results_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "CreateFinalTrainingOutput"
+              },
+              "CreateFinalTrainingOutput": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendTrainFinalOutputFunctionName}",
+                  "Payload.$": "$.validate_training_results_result.payload.training_results"
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.StatusCode",
+                  "payload.$": "$.Payload"
+                },
+                "ResultPath": "$.final_training_output_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "UpdateTrainingBaseline"
+              },
+              "UpdateTrainingBaseline": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${ComprehendTrainUpdateBaselineFunctionName}",
+                  "Payload.$": "$"
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.StatusCode",
+                  "payload.$": "$.Payload"
+                },
+                "ResultPath": "$.update_training_baseline_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "End": true
+              }
+            }
+          }
+        - UpdateTrainDataFunctionName: !Ref ComprehendUpdateTrainDataLambda
+          ComprehendTrainGateFunctionName: !Ref ComprehendTrainGateLambda
+          ComprehendTrainLevel2FunctionName: !Ref ComprehendTrainLevel2Lambda
+          ComprehendTrainLevel3FunctionName: !Ref ComprehendTrainLevel3Lambda
+          ComprehendTrainLevel3ClassifierFunctionName: !Ref ComprehendTrainLevel3ClassifierLambda
+          ComprehendTrainLevel4FunctionName: !Ref ComprehendTrainLevel4Lambda
+          ComprehendTrainUrgentFunctionName: !Ref ComprehendTrainUrgentLambda
+          ComprehendTrainActionableFunctionName: !Ref ComprehendTrainActionableLambda
+          ComprehendTrainValidateOutputFunctionName: !Ref ComprehendTrainValidateOutputLambda
+          ComprehendTrainFinalOutputFunctionName: !Ref ComprehendTrainFinalOutputLambda
+          ComprehendTrainUpdateBaselineFunctionName: !Ref ComprehendTrainUpdateBaselineLambda
+          TempBucketName: !Ref TempBucketName
+          TrainingSeedS3Uri: !Sub "s3://${TempBucketName}/Sentiment_Analysis/training_data/comprehend_training_with_headers_merged.csv"
+          Level3ArtifactS3Uri: !Sub "s3://${TempBucketName}/Sentiment_Analysis/training_data/level3/artifacts"
+
+Outputs:
+
+  ComprehendTrainingStateMachineArn:
+    Description: "ARN of the training/eval Step Function. Must match the name the daily pipeline's TriggerTrainingEval state expects."
+    Value: !GetAtt ComprehendTrainingStateMachine.Arn
+
+  ComprehendTrainActionableLambdaName:
+    Value: !Ref ComprehendTrainActionableLambda
+
+  ComprehendTrainFinalOutputLambdaName:
+    Value: !Ref ComprehendTrainFinalOutputLambda
+
+  ComprehendTrainGateLambdaName:
+    Value: !Ref ComprehendTrainGateLambda
+
+  ComprehendTrainLevel2LambdaName:
+    Value: !Ref ComprehendTrainLevel2Lambda
+
+  ComprehendTrainLevel3LambdaName:
+    Value: !Ref ComprehendTrainLevel3Lambda
+
+  ComprehendTrainLevel3ClassifierLambdaName:
+    Value: !Ref ComprehendTrainLevel3ClassifierLambda
+
+  ComprehendTrainLevel4LambdaName:
+    Value: !Ref ComprehendTrainLevel4Lambda
+
+  ComprehendTrainUpdateBaselineLambdaName:
+    Value: !Ref ComprehendTrainUpdateBaselineLambda
+
+  ComprehendTrainUrgentLambdaName:
+    Value: !Ref ComprehendTrainUrgentLambda
+
+  ComprehendTrainValidateOutputLambdaName:
+    Value: !Ref ComprehendTrainValidateOutputLambda
+
+  ComprehendUpdateTrainDataLambdaName:
+    Value: !Ref ComprehendUpdateTrainDataLambda

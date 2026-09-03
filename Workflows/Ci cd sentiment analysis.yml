@@ -1,0 +1,191 @@
+name: Deploy Sentiment Analysis Infrastructure
+
+# NOTE on triggers - flagged design decision, please confirm:
+# The old ccaas ci-cd.yml derived environment purely from git branch (main=prod,
+# else=dev), which worked when there were only two environments tied to two
+# branches. Our new template has three DeployEnv values, and "staging" is NOT a
+# separate git branch (confirmed: dev IS staging, conceptually - staging is an
+# on-demand parallel CloudFormation stack in the same nonprod account, not a
+# continuously-deployed branch). So:
+#   - push to "dev" branch  -> auto-deploy DeployEnv=dev  (unchanged behavior)
+#   - push to "main" branch -> auto-deploy DeployEnv=prod (unchanged behavior)
+#   - workflow_dispatch     -> manual trigger, lets someone deliberately deploy
+#                              to dev/staging/prod on demand from any branch -
+#                              this is the only way to reach DeployEnv=staging,
+#                              since no branch maps to it automatically.
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: "Environment to deploy (overrides branch-based default - required for staging)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64, datalake]
+
+    env:
+      AWS_REGION: us-east-1
+
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_env || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set environment variables based on trigger
+        run: |
+          # workflow_dispatch (manual) takes precedence and is the ONLY path that
+          # can produce DEPLOY_ENV=staging - push events always resolve to dev/prod.
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "DEPLOY_ENV=${{ inputs.deploy_env }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "DEPLOY_ENV=prod" >> $GITHUB_ENV
+          else
+            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+          fi
+
+          echo "CODEVERSION=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
+
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "GITHUB_EVENT_NAME=${{ github.event_name }}"
+
+      - name: Resolve script/artifact env token
+        run: |
+          # Matches the template's EnvToken logic (IsProd ? prod : dev) - dev and
+          # staging deploys SHARE the same compiled script/zip artifacts, since
+          # they're the same code on the same nonprod tier. Only the CloudFormation
+          # resource NAMES differ (via ResourceSuffix, computed inside the template
+          # itself from DeployEnv) - artifact filenames never contain "staging".
+          if [ "${DEPLOY_ENV}" == "prod" ]; then
+            echo "ARTIFACT_ENV_TOKEN=prod" >> $GITHUB_ENV
+          else
+            echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+          fi
+
+      - name: Build and upload Lambda artifacts
+        run: |
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+          ARTIFACT_PREFIX="sentiment-artifact"
+          LAMBDA_BASE="source/pipeline/lambda-functions"
+
+          # 13 Lambda functions - names must exactly match:
+          #   1) the folder name under lambda-functions/<name>/python/<name>.py
+          #   2) the FunctionName base used in the CloudFormation template
+          #   3) the S3Key base the template's !Sub expects
+          LAMBDAS=(
+            "datalake-comprehend-actionable"
+            "datalake-comprehend-clean-temp"
+            "datalake-comprehend-corrected-output"
+            "datalake-comprehend-create-endpoints"
+            "datalake-comprehend-delete-endpoints"
+            "datalake-comprehend-final-output"
+            "datalake-comprehend-level2"
+            "datalake-comprehend-level3"
+            "datalake-comprehend-level4"
+            "datalake-comprehend-raw-status-check"
+            "datalake-comprehend-sentiment"
+            "datalake-comprehend-urgent"
+            "datalake-sentiment-analysis-get-availability"
+          )
+
+          for name in "${LAMBDAS[@]}"; do
+            SRC_DIR="${LAMBDA_BASE}/${name}/python"
+            if [ -f "${SRC_DIR}/${name}.py" ]; then
+              # Zip must contain the python/ subfolder itself (not just its
+              # contents), matching the Handler convention: python.<name>.lambda_handler
+              mkdir -p "build/${name}/python"
+              cp "${SRC_DIR}/${name}.py" "build/${name}/python/"
+              (cd "build/${name}" && zip -r "../../${name}.zip" python)
+              aws s3 cp "${name}.zip" \
+                "s3://${ARTIFACT_BUCKET}/${ARTIFACT_PREFIX}/${name}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.zip" \
+                --no-verify-ssl
+            else
+              echo "WARNING: ${SRC_DIR}/${name}.py not found - skipping ${name}"
+            fi
+          done
+
+      - name: Upload Glue scripts
+        run: |
+          # Path CONFIRMED via screenshot: source/pipeline/glue/<script>.py
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+          ARTIFACT_PREFIX="sentiment-artifact"
+          GLUE_BASE="source/pipeline/glue"
+
+          mkdir -p build
+
+          for script in datalake-sentiment-analysis datalake-sentiment-analysis-curation datalake-ccaas-reconciliation-report; do
+            SRC="${GLUE_BASE}/${script}.py"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "build/${script}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py"
+              aws s3 cp "build/${script}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py" \
+                "s3://${ARTIFACT_BUCKET}/sentiment-artifact/" --no-verify-ssl
+            else
+              echo "WARNING: ${SRC} not found - skipping ${script}"
+            fi
+          done
+
+          # datalake-comprehend-glue uses its own separate, already-confirmed
+          # script location (datalake_nonprod-Glue_Scripts/) - NOT the shared
+          # sentiment-artifact prefix used by the two jobs above.
+          COMPREHEND_GLUE_SRC="${GLUE_BASE}/datalake-comprehend-glue.py"
+          if [ -f "$COMPREHEND_GLUE_SRC" ]; then
+            cp "$COMPREHEND_GLUE_SRC" "build/datalake-comprehend-glue_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py"
+            aws s3 cp "build/datalake-comprehend-glue_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py" \
+              "s3://${ARTIFACT_BUCKET}/datalake_nonprod-Glue_Scripts/" --no-verify-ssl
+          else
+            echo "WARNING: ${COMPREHEND_GLUE_SRC} not found - skipping datalake-comprehend-glue"
+          fi
+
+      - name: Validate CloudFormation template
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/sentiment_analysis_stack.yml"
+          aws cloudformation validate-template --template-body file://"$TEMPLATE"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/sentiment_analysis_stack.yml"
+          STACK_NAME="datalake-sentiment-analysis-infra-${DEPLOY_ENV}"
+          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
+
+          # No --capabilities flag needed: this template creates zero IAM
+          # resources (Ground Rule 1) - all roles are referenced by name only.
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+              DeployEnv=${DEPLOY_ENV} \
+              ArtifactBucket=${ARTIFACT_BUCKET} \
+              CodeVersion=${CODEVERSION}
+
+      - name: Print CloudFormation Events on Failure
+        if: always()
+        run: |
+          aws cloudformation describe-stack-events \
+            --stack-name "datalake-sentiment-analysis-infra-${DEPLOY_ENV}" \
+            --query 'StackEvents[?ResourceStatus==`FAILED`]' \
+            --max-items 50

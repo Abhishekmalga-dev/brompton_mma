@@ -1,0 +1,559 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Reprocessing Pipeline - sequential batch reprocessing of low-confidence
+  Comprehend classifications via Bedrock, with corrected dataset precedence and
+  dashboard/RDS refresh. Triggered asynchronously by the daily sentiment pipeline's
+  TriggerBedrockPipeline state (see sentiment_analysis_stack.yml). Kept in its own
+  CloudFormation stack so it can be modified independently of the daily pipeline,
+  same reasoning as the separate comprehend_training_stack.yml.
+
+Parameters:
+
+  DeployEnv:
+    Type: String
+    Description: "Deployment environment. dev and staging both deploy into the nonprod AWS account as fully independent, parallel stacks. prod is reserved for future use."
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  # --- Existing S3 buckets (NOT created by this template) ---
+
+  ArtifactBucket:
+    Type: String
+    Description: "Existing S3 bucket where CI/CD uploads Lambda zips for this pipeline."
+    Default: psegli-datalakenonprodli-datalake-build-dev
+
+  TempBucketName:
+    Type: String
+    Description: "Existing S3 bucket used as scratch/working storage - same bucket the daily sentiment pipeline uses (Sentiment_Analysis/final_output, training_data/, bedrock_reprocess/ paths)."
+    Default: psegli-datalakenonprodli-datalake-temp-dev
+
+  # --- Existing shared IAM roles (NOT created by this template) ---
+  # Same shared roles used by every other Lambda/Step Function in this project -
+  # confirmed pinned to "-dev" regardless of DeployEnv, same as sentiment_analysis_stack.yml.
+
+  LambdaExecutionRoleName:
+    Type: String
+    Description: "Existing shared IAM role name for Lambda execution. Pinned to '-dev' for both dev and staging deploys."
+    Default: Lambda-execution-datalake-dev
+
+  StepFunctionExecutionRoleName:
+    Type: String
+    Description: "Existing shared IAM role name for Step Functions execution. Pinned to '-dev' for both dev and staging deploys."
+    Default: stepfunction-execution-datalake-dev
+
+  # --- Versioning / artifacts ---
+
+  CodeVersion:
+    Type: String
+    Description: "Short git SHA or version identifier for artifacts, matching the CI/CD packaging convention (first 7 chars of GITHUB_SHA)."
+    Default: latest
+
+  BedrockArtifactPrefix:
+    Type: String
+    Description: "S3 key prefix (within ArtifactBucket) where CI/CD uploads this pipeline's Lambda zips. Kept separate from 'sentiment-artifact' and 'ccaas-artifact' prefixes."
+    Default: bedrock-artifact
+
+Conditions:
+
+  IsProd: !Equals [!Ref DeployEnv, "prod"]
+
+Mappings:
+  # Same naming convention as sentiment_analysis_stack.yml:
+  #   dev:      datalake-<resource>-dev
+  #   staging:  datalake-<resource>-staging-dev
+  #   prod:     datalake-<resource>-prod
+  EnvConfig:
+    dev:
+      ResourceSuffix: "dev"
+    staging:
+      ResourceSuffix: "staging-dev"
+    prod:
+      ResourceSuffix: "prod"
+
+Resources:
+
+  # --- Lambda Functions (3 new) ---
+  # Runtime/Timeout/MemorySize confirmed by you as matching project defaults:
+  # Python 3.13, 1024MB, 900s timeout, Lambda-execution-datalake-dev role.
+
+  BedrockPrepLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-bedrock-prep-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-bedrock-prep.lambda_handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${BedrockArtifactPrefix}/datalake-bedrock-prep_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  BedrockInvokeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-bedrock-invoke-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-bedrock-invoke.lambda_handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${BedrockArtifactPrefix}/datalake-bedrock-invoke_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  BedrockMergeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "datalake-bedrock-merge-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaExecutionRoleName}"
+      Handler: python.datalake-bedrock-merge.lambda_handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub
+          - "${BedrockArtifactPrefix}/datalake-bedrock-merge_${CodeVersion}_${EnvToken}.zip"
+          - EnvToken: !If [IsProd, "prod", "dev"]
+      Environment:
+        Variables:
+          ENV: !If [IsProd, "prod", "dev"]
+
+  # --- Step Function ---
+  # NOTE: datalake-comprehend-corrected-output-dev (CorrectedDashboardOutput state
+  # below) is deliberately a HARDCODED ARN, not a Ref/parameter - it's the same
+  # Lambda already deployed as a resource in sentiment_analysis_stack.yml, reused
+  # here rather than recreated, per your explicit decision to hardcode this
+  # cross-stack reference matching the existing project pattern (e.g. how
+  # TriggerBedrockPipeline itself is referenced from the other stack).
+  #
+  # RECONSTRUCTION NOTE: this DefinitionString was transcribed from 8 handheld
+  # phone screenshots of the live Step Functions console. Every field cross-checked
+  # clean against a second, independent screenshot batch you sent, EXCEPT
+  # "corrected_input_key" in BuildPaths - the source photo's States.Format() call
+  # had a placeholder-count mismatch (1 placeholder, 4 arguments - not valid syntax).
+  # Reconstructed below to match training_data_uri's shape (same folder, different
+  # filename) as the highest-confidence guess. PLEASE DIFF THIS ONE FIELD against
+  # the live console before deploying.
+
+  BedrockPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub
+        - "datalake-bedrock-pipeline-temp-${Suffix}"
+        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
+      RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StepFunctionExecutionRoleName}"
+      StateMachineType: STANDARD
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Sequential Bedrock batch reprocessing with corrected dataset precedence and dashboard/RDS refresh",
+            "StartAt": "ConfigureRun",
+            "States": {
+              "ConfigureRun": {
+                "Type": "Pass",
+                "Parameters": {
+                  "bucket": "${TempBucketName}",
+                  "base_prefix": "Sentiment_Analysis",
+                  "run_id.$": "$.run_id",
+                  "source_system.$": "$.source_system",
+                  "prompt_version": "v1",
+                  "random_seed": 42,
+                  "batch_size": 25,
+                  "max_batches": 50,
+                  "target_topics": [
+                    "overall_sentiment",
+                    "level2_category",
+                    "level3_subcategory",
+                    "level4_team",
+                    "is_actionable",
+                    "is_urgent"
+                  ],
+                  "confidence_thresholds": {
+                    "overall_sentiment": 0.5,
+                    "level2_category": 0.5,
+                    "level3_subcategory": 0.5,
+                    "level4_team": 0.5,
+                    "is_actionable": 0.5,
+                    "is_urgent": 0.5
+                  },
+                  "bedrock_prep_mode.$": "$.bedrock_prep_mode",
+                  "execution_name.$": "$$.Execution.Name"
+                },
+                "Next": "BuildPaths"
+              },
+              "BuildPaths": {
+                "Type": "Pass",
+                "Parameters": {
+                  "bucket.$": "$.bucket",
+                  "base_prefix.$": "$.base_prefix",
+                  "run_id.$": "$.run_id",
+                  "source_system.$": "$.source_system",
+                  "prompt_version.$": "$.prompt_version",
+                  "random_seed.$": "$.random_seed",
+                  "batch_size.$": "$.batch_size",
+                  "max_batches.$": "$.max_batches",
+                  "target_topics.$": "$.target_topics",
+                  "confidence_thresholds.$": "$.confidence_thresholds",
+                  "bedrock_prep_mode.$": "$.bedrock_prep_mode",
+                  "execution_name.$": "$.execution_name",
+                  "final_output_uri.$": "States.Format('s3://{}/{}/final_output/{}_final_output_all_columns.csv', $.bucket, $.base_prefix, $.source_system)",
+                  "training_data_uri.$": "States.Format('s3://{}/{}/training_data/comprehend_training_with_headers_merged.csv', $.bucket, $.base_prefix)",
+                  "bedrock_config_prefix.$": "States.Format('s3://{}/{}/bedrock_configs/', $.bucket, $.base_prefix)",
+                  "bedrock_prep_prefix.$": "States.Format('s3://{}/{}/bedrock_reprocess/{}/{}/bedrock_prep/', $.bucket, $.base_prefix, $.source_system, $.execution_name)",
+                  "batch_output_prefix_uri.$": "States.Format('s3://{}/{}/bedrock_reprocess/{}/{}/bedrock_invoke/batches/', $.bucket, $.base_prefix, $.source_system, $.execution_name)",
+                  "combined_corrections_uri.$": "States.Format('s3://{}/{}/bedrock_reprocess/{}/{}/bedrock_invoke/combined_bedrock_corrections.csv', $.bucket, $.base_prefix, $.source_system, $.execution_name)",
+                  "corrected_input_key.$": "States.Format('{}/training_data/corrected_final_output.csv', $.bucket, $.base_prefix, $.source_system, $.execution_name)"
+                },
+                "Next": "PrepareLowConfidenceFiles"
+              },
+              "PrepareLowConfidenceFiles": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${BedrockPrepFunctionName}",
+                  "Payload": {
+                    "run_id.$": "$.run_id",
+                    "source_system.$": "$.source_system",
+                    "final_output_uri.$": "$.final_output_uri",
+                    "training_data_uri.$": "$.training_data_uri",
+                    "bedrock_config_prefix.$": "$.bedrock_config_prefix",
+                    "bedrock_prep_prefix.$": "$.bedrock_prep_prefix",
+                    "prompt_version.$": "$.prompt_version",
+                    "random_seed.$": "$.random_seed",
+                    "batch_size.$": "$.batch_size",
+                    "max_batches.$": "$.max_batches",
+                    "target_topics.$": "$.target_topics",
+                    "confidence_thresholds.$": "$.confidence_thresholds",
+                    "bedrock_prep_mode.$": "$.bedrock_prep_mode"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.bedrock_prep_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.prep_error",
+                    "Next": "PrepFailed"
+                  }
+                ],
+                "Next": "PrepSucceeded"
+              },
+              "PrepSucceeded": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.bedrock_prep_result.statusCode",
+                    "NumericEquals": 200,
+                    "Next": "AnyLowConfidenceRecords"
+                  }
+                ],
+                "Default": "PrepFailed"
+              },
+              "AnyLowConfidenceRecords": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.bedrock_prep_result.body.total_low_confidence_records",
+                    "NumericGreaterThan": 0,
+                    "Next": "InitializeBatchLoop"
+                  }
+                ],
+                "Default": "NoLowConfidenceRecords"
+              },
+              "InitializeBatchLoop": {
+                "Type": "Pass",
+                "Parameters": {
+                  "current_batch": 0,
+                  "batch_count.$": "$.bedrock_prep_result.body.batch_count"
+                },
+                "ResultPath": "$.loop",
+                "Next": "InvokeNextBedrockBatch"
+              },
+              "InvokeNextBedrockBatch": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${BedrockInvokeFunctionName}",
+                  "Payload": {
+                    "mode": "BATCH_URI",
+                    "run_id.$": "$.run_id",
+                    "source_system.$": "$.source_system",
+                    "prompt_version.$": "$.prompt_version",
+                    "bedrock_config_prefix.$": "$.bedrock_config_prefix",
+                    "batch_index.$": "$.loop.current_batch",
+                    "batch_input_uri.$": "States.Format('{}batch_{}.jsonl', $.bedrock_prep_result.body.batch_input_prefix_uri, $.loop.current_batch)",
+                    "batch_output_prefix_uri.$": "$.batch_output_prefix_uri",
+                    "batch_execution_id.$": "States.Format('{}-batch-{}', $.execution_name, $.loop.current_batch)"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.batch_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.batch_error",
+                    "Next": "BatchFailed"
+                  }
+                ],
+                "Next": "BatchSucceeded"
+              },
+              "BatchSucceeded": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.batch_result.statusCode",
+                    "NumericEquals": 200,
+                    "Next": "IncrementBatchIndex"
+                  }
+                ],
+                "Default": "BatchFailed"
+              },
+              "IncrementBatchIndex": {
+                "Type": "Pass",
+                "Parameters": {
+                  "current_batch.$": "States.MathAdd($.loop.current_batch, 1)",
+                  "batch_count.$": "$.loop.batch_count"
+                },
+                "ResultPath": "$.loop",
+                "Next": "MoreBatches"
+              },
+              "MoreBatches": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.loop.current_batch",
+                    "NumericLessThanPath": "$.loop.batch_count",
+                    "Next": "InvokeNextBedrockBatch"
+                  }
+                ],
+                "Default": "CombineAndMergeCorrections"
+              },
+              "CombineAndMergeCorrections": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${BedrockMergeFunctionName}",
+                  "Payload": {
+                    "bucket.$": "$.bucket",
+                    "base_prefix.$": "$.base_prefix",
+                    "run_id.$": "$.run_id",
+                    "source_system.$": "$.source_system",
+                    "final_output_uri.$": "$.final_output_uri",
+                    "bedrock_mode": "BATCH",
+                    "combine_batch_outputs": true,
+                    "bedrock_corrections_prefix.$": "$.batch_output_prefix_uri",
+                    "bedrock_corrections_csv_uri.$": "$.combined_corrections_uri",
+                    "batch_count.$": "$.loop.batch_count",
+                    "execution_name.$": "$.execution_name"
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "body.$": "States.StringToJson($.Payload.body)"
+                },
+                "ResultPath": "$.bedrock_merge_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.merge_error",
+                    "Next": "MergeFailed"
+                  }
+                ],
+                "Next": "MergeSucceeded"
+              },
+              "MergeSucceeded": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.bedrock_merge_result.statusCode",
+                    "NumericEquals": 200,
+                    "Next": "CorrectedDashboardOutput"
+                  }
+                ],
+                "Default": "MergeFailed"
+              },
+              "CorrectedDashboardOutput": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:datalake-comprehend-corrected-output-dev",
+                  "Payload": {
+                    "bucket.$": "$.bucket",
+                    "base_prefix.$": "$.base_prefix",
+                    "run_id.$": "$.run_id",
+                    "source_system.$": "$.source_system",
+                    "bedrock_refresh_mode": true,
+                    "load_mode": "FULL_REPLACE",
+                    "corrected_input_key.$": "$.corrected_input_key",
+                    "update_corrected_file": true,
+                    "update_rds": true,
+                    "update_dlportal": true
+                  }
+                },
+                "ResultSelector": {
+                  "statusCode.$": "$.Payload.statusCode",
+                  "bucket.$": "$.Payload.bucket",
+                  "run_id.$": "$.Payload.run_id",
+                  "source_system.$": "$.Payload.source_system",
+                  "run_trimmed_input.$": "$.Payload.run_trimmed_input",
+                  "run_all_columns_input.$": "$.Payload.run_all_columns_input",
+                  "consolidated_trimmed_output.$": "$.Payload.consolidated_trimmed_output",
+                  "consolidated_all_columns_output.$": "$.Payload.consolidated_all_columns_output",
+                  "trimmed_dashboard_output.$": "$.Payload.trimmed_dashboard_output",
+                  "all_columns_dashboard_output.$": "$.Payload.all_columns_dashboard_output",
+                  "trimmed_rows.$": "$.Payload.trimmed_rows",
+                  "all_columns_rows.$": "$.Payload.all_columns_rows",
+                  "corrected_rows.$": "$.Payload.corrected_rows",
+                  "trimmed_records_replaced.$": "$.Payload.trimmed_records_replaced",
+                  "all_columns_records_updated.$": "$.Payload.all_columns_records_updated",
+                  "all_columns_updated_column_count.$": "$.Payload.all_columns_updated_column_count",
+                  "all_columns_updated_columns.$": "$.Payload.all_columns_updated_columns",
+                  "rds_result.$": "$.Payload.rds_result",
+                  "bedrock_refresh_mode.$": "$.Payload.bedrock_refresh_mode"
+                },
+                "ResultPath": "$.corrected_dashboard_output_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.corrected_dashboard_error",
+                    "Next": "CorrectedDashboardFailed"
+                  }
+                ],
+                "Next": "CorrectedDashboardSucceeded"
+              },
+              "CorrectedDashboardSucceeded": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.corrected_dashboard_output_result.statusCode",
+                    "NumericEquals": 200,
+                    "Next": "Complete"
+                  }
+                ],
+                "Default": "CorrectedDashboardFailed"
+              },
+              "Complete": {
+                "Type": "Succeed"
+              },
+              "NoLowConfidenceRecords": {
+                "Type": "Succeed"
+              },
+              "PrepFailed": {
+                "Type": "Fail",
+                "Error": "BedrockPrepFailed",
+                "Cause": "The Bedrock preparation Lambda failed or returned a non-200 status code."
+              },
+              "BatchFailed": {
+                "Type": "Fail",
+                "Error": "BedrockBatchFailed",
+                "Cause": "A Bedrock batch failed or returned a non-200 status code."
+              },
+              "MergeFailed": {
+                "Type": "Fail",
+                "Error": "BedrockMergeFailed",
+                "Cause": "The Bedrock merge Lambda failed or returned a non-200 status code."
+              },
+              "CorrectedDashboardFailed": {
+                "Type": "Fail",
+                "Error": "CorrectedDashboardOutputFailed",
+                "Cause": "The corrected dashboard output Lambda failed or returned a non-200 status code."
+              }
+            }
+          }
+        - TempBucketName: !Ref TempBucketName
+          BedrockPrepFunctionName: !Ref BedrockPrepLambda
+          BedrockInvokeFunctionName: !Ref BedrockInvokeLambda
+          BedrockMergeFunctionName: !Ref BedrockMergeLambda
+
+Outputs:
+
+  BedrockPipelineStateMachineArn:
+    Description: "ARN of the Bedrock reprocessing Step Function - referenced by sentiment_analysis_stack.yml's TriggerBedrockPipeline state."
+    Value: !GetAtt BedrockPipelineStateMachine.Arn
+
+  BedrockPrepLambdaArn:
+    Value: !GetAtt BedrockPrepLambda.Arn
+
+  BedrockInvokeLambdaArn:
+    Value: !GetAtt BedrockInvokeLambda.Arn
+
+  BedrockMergeLambdaArn:
+    Value: !GetAtt BedrockMergeLambda.Arn
