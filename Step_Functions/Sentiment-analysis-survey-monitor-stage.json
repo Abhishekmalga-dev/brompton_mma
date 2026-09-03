@@ -328,6 +328,37 @@
         {
           "Variable": "$.comprehend_pipeline_result.Status",
           "StringEquals": "SUCCEEDED",
+          "Next": "StartReconciliationGlueJob"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "StartReconciliationGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "datalake-ccaas-reconciliation-report-dev",
+        "Arguments": {
+          "--ENV": "dev",
+          "--EVENT_DATES_S3_PATH": "s3://psegli-datalakenonprodli-datalake-temp-dev/ccaas/event_dates/survey_api_json/event_dates.json",
+          "--conf": "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true"
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckReconciliationStatus"
+    },
+    "CheckReconciliationStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.JobRunState",
+          "StringEquals": "SUCCEEDED",
           "Next": "Success"
         }
       ],
