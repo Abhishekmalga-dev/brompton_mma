@@ -38,8 +38,15 @@ jobs:
     env:
       AWS_REGION: us-east-1
 
+    # NOTE: GitHub Actions does NOT expose the `env` context inside this
+    # `environment:` key - only github/vars/inputs/needs are valid here.
+    # This field is purely for GitHub's optional deployment-approval feature;
+    # it has no effect on the actual AWS deploy target (that's $DEPLOY_ENV,
+    # set correctly below from the real MANUAL_DEPLOY_ENV shell env var).
+    # So for a manual workflow_dispatch run, this just shows "dev" here
+    # regardless of MANUAL_DEPLOY_ENV's value - cosmetic only, not a bug.
     environment:
-      name: ${{ github.event_name == 'workflow_dispatch' && env.MANUAL_DEPLOY_ENV || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
+      name: ${{ github.ref == 'refs/heads/main' && 'production' || 'dev' }}
 
 
     steps:

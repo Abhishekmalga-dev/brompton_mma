@@ -40,7 +40,7 @@ jobs:
       AWS_REGION: us-east-1
 
     environment:
-      name: ${{ github.event_name == 'workflow_dispatch' && env.MANUAL_DEPLOY_ENV || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
+      name: ${{ github.ref == 'refs/heads/main' && 'production' || 'dev' }}
 
     steps:
       - name: Checkout repository
