@@ -18,17 +18,19 @@ on:
     branches:
       - dev
       - main
-  workflow_dispatch:
-    inputs:
-      deploy_env:
-        description: "Environment to deploy (overrides branch-based default - required for staging)"
-        required: true
-        type: choice
-        options:
-          - dev
-          - staging
-          - prod
-        default: dev
+  workflow_dispatch: {}
+
+env:
+  # MANUAL_DEPLOY_ENV is used ONLY for manual workflow_dispatch runs. Push-based
+  # auto-deploys are completely unaffected - they always resolve DEPLOY_ENV from
+  # the branch name (dev branch -> dev, main branch -> prod), exactly as before.
+  #
+  # To manually deploy to an environment other than dev: edit this value directly
+  # in this file (e.g. change to "staging"), save/commit, then run the workflow
+  # via workflow_dispatch in the GitHub Actions UI. IMPORTANT: change it back to
+  # "dev" afterward - otherwise a future accidental manual run will silently
+  # redeploy staging instead of dev.
+  MANUAL_DEPLOY_ENV: dev
 
 jobs:
   deploy:
@@ -38,7 +40,7 @@ jobs:
       AWS_REGION: us-east-1
 
     environment:
-      name: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_env || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
+      name: ${{ github.event_name == 'workflow_dispatch' && env.MANUAL_DEPLOY_ENV || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
 
     steps:
       - name: Checkout repository
@@ -55,7 +57,7 @@ jobs:
       - name: Set environment variables based on trigger
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "DEPLOY_ENV=${{ inputs.deploy_env }}" >> $GITHUB_ENV
+            echo "DEPLOY_ENV=${MANUAL_DEPLOY_ENV}" >> $GITHUB_ENV
           elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
             echo "DEPLOY_ENV=prod" >> $GITHUB_ENV
           else
@@ -67,6 +69,22 @@ jobs:
           echo "GITHUB_REF=$GITHUB_REF"
           echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
           echo "GITHUB_EVENT_NAME=${{ github.event_name }}"
+
+      - name: Validate DEPLOY_ENV
+        run: |
+          # Catches a typo in the hardcoded MANUAL_DEPLOY_ENV value now, before
+          # the Lambda build/upload steps run, rather than failing later at the
+          # CloudFormation deploy step.
+          case "${DEPLOY_ENV}" in
+            dev|staging|prod)
+              echo "DEPLOY_ENV=${DEPLOY_ENV} is valid."
+              ;;
+            *)
+              echo "ERROR: DEPLOY_ENV='${DEPLOY_ENV}' is not valid. Must be exactly one of: dev, staging, prod." >&2
+              echo "Check MANUAL_DEPLOY_ENV at the top of this workflow file for a typo." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Resolve script/artifact env token
         run: |

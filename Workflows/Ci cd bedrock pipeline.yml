@@ -1,10 +1,21 @@
 name: Deploy Bedrock Pipeline Infrastructure
 
-# Mirrors ci-cd-sentiment-analysis.yml's trigger/environment logic exactly -
-# same DeployEnv resolution (dev/staging/prod), same reasoning for why staging
-# can only be reached via workflow_dispatch. No pipeline-specific deviation
-# needed here; this is a separate stack purely so it can be deployed/rolled
-# back independently of the daily sentiment pipeline.
+# NOTE on triggers:
+# Push-to-branch auto-deploy behavior is UNCHANGED:
+#   - push to "dev" branch  -> auto-deploy DeployEnv=dev  (unchanged behavior)
+#   - push to "main" branch -> auto-deploy DeployEnv=prod (unchanged behavior)
+#
+# workflow_dispatch (manual "Run workflow" trigger) no longer prompts for an
+# environment at run time. Instead, MANUAL_DEPLOY_ENV below is a hardcoded
+# value you edit directly in this file before running the workflow manually -
+# this is the ONLY way to reach DeployEnv=staging, since no branch maps to it
+# automatically. To deploy to staging: change MANUAL_DEPLOY_ENV to "staging"
+# below, save/commit, then trigger "Run workflow" from the Actions tab.
+# Change it back to "dev" (or whatever) afterward so a future accidental
+# manual run doesn't silently redeploy staging.
+# (Mirrors ci-cd-sentiment-analysis.yml's identical mechanism - kept
+# consistent across both workflows on request.)
+
 on:
   push:
     branches:
@@ -14,17 +25,13 @@ on:
     branches:
       - dev
       - main
-  workflow_dispatch:
-    inputs:
-      deploy_env:
-        description: "Environment to deploy (overrides branch-based default - required for staging)"
-        required: true
-        type: choice
-        options:
-          - dev
-          - staging
-          - prod
-        default: dev
+  workflow_dispatch: {}
+
+env:
+  # EDIT THIS LINE to choose the target for manual (workflow_dispatch) runs
+  # only. Push-triggered runs ignore this value entirely - see note above.
+  # Allowed values: dev, staging, prod
+  MANUAL_DEPLOY_ENV: dev
 
 jobs:
   deploy:
@@ -34,7 +41,7 @@ jobs:
       AWS_REGION: us-east-1
 
     environment:
-      name: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_env || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
+      name: ${{ github.event_name == 'workflow_dispatch' && env.MANUAL_DEPLOY_ENV || (github.ref == 'refs/heads/main' && 'production' || 'dev') }}
 
     steps:
       - name: Checkout repository
@@ -50,8 +57,11 @@ jobs:
 
       - name: Set environment variables based on trigger
         run: |
+          # workflow_dispatch (manual) reads the hardcoded MANUAL_DEPLOY_ENV
+          # value from this file - push events always resolve to dev/prod
+          # from the branch name, same as before.
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "DEPLOY_ENV=${{ inputs.deploy_env }}" >> $GITHUB_ENV
+            echo "DEPLOY_ENV=${MANUAL_DEPLOY_ENV}" >> $GITHUB_ENV
           elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
             echo "DEPLOY_ENV=prod" >> $GITHUB_ENV
           else
@@ -59,6 +69,20 @@ jobs:
           fi
 
           echo "CODEVERSION=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Validate DEPLOY_ENV
+        run: |
+          # Catches a typo'd MANUAL_DEPLOY_ENV (or any unexpected value) before
+          # the Lambda build/upload steps run, rather than failing later at the
+          # CloudFormation deploy step after time has already been spent.
+          case "${DEPLOY_ENV}" in
+            dev|staging|prod) ;;
+            *)
+              echo "ERROR: DEPLOY_ENV='${DEPLOY_ENV}' is not one of dev, staging, prod."
+              echo "Check the MANUAL_DEPLOY_ENV value near the top of this workflow file."
+              exit 1
+              ;;
+          esac
 
       - name: Resolve script/artifact env token
         run: |
