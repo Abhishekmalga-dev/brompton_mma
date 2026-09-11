@@ -89,21 +89,34 @@ jobs:
 
       - name: Resolve script/artifact env token
         run: |
-          # Matches the template's EnvToken logic (IsProd ? prod : dev) - dev and
-          # staging deploys SHARE the same compiled script/zip artifacts, since
-          # they're the same code on the same nonprod tier. Only the CloudFormation
-          # resource NAMES differ (via ResourceSuffix, computed inside the template
-          # itself from DeployEnv) - artifact filenames never contain "staging".
+          # ARTIFACT_ENV_TOKEN: matches the template's EnvToken logic
+          # (IsProd ? prod : dev) - used inside artifact FILENAMES.
+          #
+          # ARTIFACT_BUCKET: dev and staging ALWAYS use the same build-dev
+          # bucket - there is no separate "-build-staging" bucket in AWS.
+          # Only prod gets its own bucket.
+          #
+          # ARTIFACT_PREFIX: dev and prod use the normal "sentiment-artifact"
+          # S3 folder. staging uses a SEPARATE "staging-sentiment-artifact"
+          # folder in that same shared bucket, so a staging deploy uploads
+          # and reads its own isolated copies of every Lambda zip and Glue
+          # script - it no longer shares artifact files with dev at all.
           if [ "${DEPLOY_ENV}" == "prod" ]; then
             echo "ARTIFACT_ENV_TOKEN=prod" >> $GITHUB_ENV
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-prod" >> $GITHUB_ENV
+            echo "ARTIFACT_PREFIX=sentiment-artifact" >> $GITHUB_ENV
+          elif [ "${DEPLOY_ENV}" == "staging" ]; then
+            echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-dev" >> $GITHUB_ENV
+            echo "ARTIFACT_PREFIX=staging-sentiment-artifact" >> $GITHUB_ENV
           else
             echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-dev" >> $GITHUB_ENV
+            echo "ARTIFACT_PREFIX=sentiment-artifact" >> $GITHUB_ENV
           fi
 
       - name: Build and upload Lambda artifacts
         run: |
-          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
-          ARTIFACT_PREFIX="sentiment-artifact"
           LAMBDA_BASE="source/pipeline/lambda-functions"
 
           # 13 Lambda functions - names must exactly match:
@@ -145,8 +158,6 @@ jobs:
       - name: Upload Glue scripts
         run: |
           # Path CONFIRMED via screenshot: source/pipeline/glue/<script>.py
-          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
-          ARTIFACT_PREFIX="sentiment-artifact"
           GLUE_BASE="source/pipeline/glue"
 
           mkdir -p build
@@ -156,7 +167,7 @@ jobs:
             if [ -f "$SRC" ]; then
               cp "$SRC" "build/${script}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py"
               aws s3 cp "build/${script}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py" \
-                "s3://${ARTIFACT_BUCKET}/sentiment-artifact/" --no-verify-ssl
+                "s3://${ARTIFACT_BUCKET}/${ARTIFACT_PREFIX}/" --no-verify-ssl
             else
               echo "WARNING: ${SRC} not found - skipping ${script}"
             fi
@@ -183,7 +194,6 @@ jobs:
         run: |
           TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/sentiment_analysis_stack.yml"
           STACK_NAME="datalake-sentiment-analysis-infra-${DEPLOY_ENV}"
-          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
 
           # No --capabilities flag needed: this template creates zero IAM
           # resources (Ground Rule 1) - all roles are referenced by name only.

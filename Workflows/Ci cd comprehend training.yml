@@ -86,8 +86,32 @@ jobs:
               ;;
           esac
 
-      - name: Resolve script/artifact env token
+      - name: Resolve artifact bucket/prefix and env token
         run: |
+          # ARTIFACT_BUCKET: dev and staging share the SAME bucket (-build-dev) -
+          # there is no separate staging artifact bucket in this project. Only
+          # prod gets its own bucket. Fixing this here (and ONLY here) matters:
+          # this used to be redeclared separately in two other steps below, and
+          # a staging deploy would resolve to a "-build-staging" bucket that
+          # doesn't exist, failing partway through with a bucket-not-found error.
+          if [ "${DEPLOY_ENV}" == "prod" ]; then
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-prod" >> $GITHUB_ENV
+          else
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-dev" >> $GITHUB_ENV
+          fi
+
+          # ARTIFACT_PREFIX: dev and prod use the normal "training-artifact"
+          # folder. staging gets its own isolated "staging-training-artifact"
+          # folder in the SAME bucket, so it never shares/overwrites dev's
+          # artifact files despite living in the same bucket.
+          if [ "${DEPLOY_ENV}" == "staging" ]; then
+            echo "ARTIFACT_PREFIX=staging-training-artifact" >> $GITHUB_ENV
+          else
+            echo "ARTIFACT_PREFIX=training-artifact" >> $GITHUB_ENV
+          fi
+
+          # Same sharing logic as the daily pipeline: dev and staging deploys
+          # share the same compiled zip artifacts (same nonprod tier, same code).
           if [ "${DEPLOY_ENV}" == "prod" ]; then
             echo "ARTIFACT_ENV_TOKEN=prod" >> $GITHUB_ENV
           else
@@ -96,8 +120,6 @@ jobs:
 
       - name: Build and upload Lambda artifacts
         run: |
-          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
-          ARTIFACT_PREFIX="training-artifact"
           LAMBDA_BASE="source/pipeline/lambda-functions"
 
           LAMBDAS=(
@@ -137,7 +159,6 @@ jobs:
         run: |
           TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/comprehend_training_stack.yml"
           STACK_NAME="datalake-comprehend-training-infra-${DEPLOY_ENV}"
-          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
 
           aws cloudformation deploy \
             --template-file "$TEMPLATE" \

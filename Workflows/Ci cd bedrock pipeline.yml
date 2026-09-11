@@ -86,18 +86,28 @@ jobs:
 
       - name: Resolve script/artifact env token
         run: |
-          # Same logic as ci-cd-sentiment-analysis.yml: dev and staging deploys
-          # share the same compiled artifacts (same nonprod tier, same code).
+          # ARTIFACT_BUCKET: dev and staging ALWAYS use the same build-dev
+          # bucket - there is no separate "-build-staging" bucket in AWS.
+          # ARTIFACT_PREFIX: staging gets its own separate S3 folder
+          # ("staging-bedrock-artifact") in that same shared bucket, so a
+          # staging deploy uploads/reads isolated copies of every Lambda zip -
+          # it no longer shares artifact files with dev at all.
           if [ "${DEPLOY_ENV}" == "prod" ]; then
             echo "ARTIFACT_ENV_TOKEN=prod" >> $GITHUB_ENV
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-prod" >> $GITHUB_ENV
+            echo "ARTIFACT_PREFIX=bedrock-artifact" >> $GITHUB_ENV
+          elif [ "${DEPLOY_ENV}" == "staging" ]; then
+            echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-dev" >> $GITHUB_ENV
+            echo "ARTIFACT_PREFIX=staging-bedrock-artifact" >> $GITHUB_ENV
           else
             echo "ARTIFACT_ENV_TOKEN=dev" >> $GITHUB_ENV
+            echo "ARTIFACT_BUCKET=psegli-datalakenonprodli-datalake-build-dev" >> $GITHUB_ENV
+            echo "ARTIFACT_PREFIX=bedrock-artifact" >> $GITHUB_ENV
           fi
 
       - name: Build and upload Lambda artifacts
         run: |
-          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
-          ARTIFACT_PREFIX="bedrock-artifact"
           LAMBDA_BASE="source/pipeline/lambda-functions"
 
           # 3 new Lambdas for this pipeline. NOTE: datalake-comprehend-corrected-output
@@ -132,7 +142,6 @@ jobs:
         run: |
           TEMPLATE="$GITHUB_WORKSPACE/source/cloudformation/bedrock_pipeline_stack.yml"
           STACK_NAME="datalake-bedrock-pipeline-infra-${DEPLOY_ENV}"
-          ARTIFACT_BUCKET="psegli-datalakenonprodli-datalake-build-${DEPLOY_ENV}"
 
           # No --capabilities flag needed: this template creates zero IAM
           # resources - all roles are referenced by name only, same as
