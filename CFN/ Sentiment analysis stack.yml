@@ -257,63 +257,7 @@ Resources:
       Tags:
         use-case: sentiment-analysis
 
-  # --- CCaaS Reconciliation Report Glue Job ---
-  # PySpark job (glueetl, not pythonshell), GlueVersion 5.1 to match every other
-  # Glue job in this stack (confirmed - overrides the originally-requested 5.0).
-  # Script path follows the SentimentAnalysisGlueJob convention (parameterized
-  # ${SentimentArtifactPrefix}), per confirmed decision, even though this job is
-  # CCaaS-specific rather than sentiment-specific - kept in the same shared
-  # artifact folder rather than creating a new prefix parameter.
-  #
-  # --EVENT_DATE is intentionally NOT included in DefaultArguments: it's a
-  # single-date manual-run override, read via manual sys.argv parsing in the
-  # job script (per this project's established convention), and left absent
-  # by default so a normal scheduled/triggered run doesn't accidentally pin
-  # itself to one date. Pass it at invocation time only when doing a targeted
-  # single-date run.
-  #
-  # --EVENT_DATES_S3_PATH DOES have a real default, confirmed via console
-  # screenshot of the live job's Job Parameters tab - it's not actually
-  # optional/absent in practice the way --EVENT_DATE is, so it's included
-  # below with its real value.
-
-  ReconciliationReportGlueJob:
-    Type: AWS::Glue::Job
-    Properties:
-      Name: !Sub
-        - "datalake-ccaas-reconciliation-report-${Suffix}"
-        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
-      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}"
-      Command:
-        Name: glueetl
-        PythonVersion: "3"
-        ScriptLocation: !Sub
-          - "s3://${ArtifactBucket}/${SentimentArtifactPrefix}/datalake-ccaas-reconciliation-report_${CodeVersion}_${EnvToken}.py"
-          - EnvToken: !If [IsProd, "prod", "dev"]
-      GlueVersion: "5.1"
-      WorkerType: G.1X
-      NumberOfWorkers: 10
-      MaxRetries: 0
-      Timeout: 480
-      ExecutionProperty:
-        MaxConcurrentRuns: 1
-      DefaultArguments:
-        "--TempDir": !Ref GlueTempDirPath
-        "--conf": "spark.eventLog.rolling.enabled=true"
-        "--job-bookmark-option": "job-bookmark-disable"
-        "--enable-metrics": "true"
-        "--enable-observability-metrics": "true"
-        "--enable-continuous-cloudwatch-log": "true"
-        "--ENV": !If [IsProd, "prod", "dev"]
-        "--EVENT_DATES_S3_PATH": "s3://psegli-datalakenonprodli-datalake-temp-dev/ccaas/event_dates/survey_api_json/event_dates.json"
-      Tags:
-        use-case: ccaas-reconciliation
-  # Replicated per environment (Option 2, per confirmed decision). Schema confirmed
-  # via console: partition key execution_date (String), no sort key, on-demand
-  # billing, no GSIs, PITR off. The Lambda now reads this table's name from the
-  # TRACKER_TABLE_NAME environment variable (code updated to remove the previous
-  # hardcoded "datalake-sentiment-analysis-tracker-dev" literal).
-
+  # --- DynamoDB: availability-tracking table read by datalake-sentiment-analysis-get-availability ---
   SentimentAnalysisTrackerTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -327,59 +271,6 @@ Resources:
       KeySchema:
         - AttributeName: execution_date
           KeyType: HASH
-
-  # --- CCaaS Reconciliation Report Crawler ---
-  # Catalogs the Glue job's output. NOT triggered by EventBridge or any
-  # schedule - per confirmed decision, the Glue job itself calls
-  # boto3 start_crawler() at the end of a successful run. This resource only
-  # needs to exist for that call to have a crawler to target; no trigger
-  # resource is created here.
-  #
-  # DatabaseName confirmed via Glue console screenshot of Data Catalog ->
-  # Databases: "datalake-sentiment-analysis-dev" - same database every other
-  # CCaaS/sentiment table in this project is cataloged under, exactly as
-  # originally guessed but confirmed rather than assumed.
-
-  ReconciliationReportCrawler:
-    Type: AWS::Glue::Crawler
-    Properties:
-      Name: !Sub
-        - "datalake-reconciliation-report-${Suffix}"
-        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
-      Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueServiceRoleName}"
-      DatabaseName: datalake-sentiment-analysis-dev
-      Targets:
-        S3Targets:
-          - Path: !Sub "s3://${CuratedBucketName}/ccaas/data_reconciliation_report/"
-      SchemaChangePolicy:
-        UpdateBehavior: UPDATE_IN_DATABASE
-        DeleteBehavior: LOG
-
-  # --- CCaaS Reconciliation DynamoDB table ---
-  # Same shape/pattern as SentimentAnalysisTrackerTable above (on-demand
-  # billing, no GSIs/LSIs), extended with a sort key per the confirmed schema:
-  # partition key event_date (String), sort key survey_type (String) - allows
-  # multiple survey types to be tracked per date without overwriting each
-  # other, same reasoning as the update_item-over-put_item principle already
-  # established for the sentiment tracker table.
-
-  ReconciliationTrackerTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub
-        - "datalake-ccaas-reconciliation-${Suffix}"
-        - Suffix: !FindInMap [EnvConfig, !Ref DeployEnv, ResourceSuffix]
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: event_date
-          AttributeType: S
-        - AttributeName: survey_type
-          AttributeType: S
-      KeySchema:
-        - AttributeName: event_date
-          KeyType: HASH
-        - AttributeName: survey_type
-          KeyType: RANGE
 
   # --- Lambda Functions (13 total) ---
   # Shared settings (Runtime/Timeout/MemorySize/EphemeralStorage) confirmed via
@@ -1704,37 +1595,6 @@ Resources:
                 "Choices": [
                   {
                     "Variable": "$.comprehend_pipeline_result.Status",
-                    "StringEquals": "SUCCEEDED",
-                    "Next": "StartReconciliationGlueJob"
-                  }
-                ],
-                "Default": "NotifyFailure"
-              },
-              "StartReconciliationGlueJob": {
-                "Type": "Task",
-                "Resource": "arn:aws:states:::glue:startJobRun.sync",
-                "Parameters": {
-                  "JobName": "datalake-ccaas-reconciliation-report-dev",
-                  "Arguments": {
-                    "--ENV": "dev",
-                    "--EVENT_DATES_S3_PATH": "s3://psegli-datalakenonprodli-datalake-temp-dev/ccaas/event_dates/survey_api_json/event_dates.json",
-                    "--conf": "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true"
-                  }
-                },
-                "Catch": [
-                  {
-                    "ErrorEquals": ["States.ALL"],
-                    "ResultPath": "$.error",
-                    "Next": "NotifyFailure"
-                  }
-                ],
-                "Next": "CheckReconciliationStatus"
-              },
-              "CheckReconciliationStatus": {
-                "Type": "Choice",
-                "Choices": [
-                  {
-                    "Variable": "$.JobRunState",
                     "StringEquals": "SUCCEEDED",
                     "Next": "Success"
                   }

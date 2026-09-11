@@ -138,7 +138,7 @@ jobs:
 
           mkdir -p build
 
-          for script in datalake-sentiment-analysis datalake-sentiment-analysis-curation datalake-ccaas-reconciliation-report; do
+          for script in datalake-sentiment-analysis datalake-sentiment-analysis-curation; do
             SRC="${GLUE_BASE}/${script}.py"
             if [ -f "$SRC" ]; then
               cp "$SRC" "build/${script}_${CODEVERSION}_${ARTIFACT_ENV_TOKEN}.py"
