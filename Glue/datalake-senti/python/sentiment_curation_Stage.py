@@ -488,3 +488,35 @@ for event_date_value in dates_to_process:
 
 print("Job completed successfully.")
 job.commit()
+
+
+
+---------
+
+#Change 1: before the loop. Put this next to all_dates_processed = [] and source_new_records_report = [], just above for event_date_value in dates_to_process:.
+availability_flags = {
+    "ivr": False,
+    "sms_web_transactional": False,
+    "sms_web_relational": False,
+    "api_web_transactional": False,
+    "api_web_relational": False,
+}
+
+#Change 2: at the end of the loop body. Put this where the normal path does source_new_records_report.append({...}), after dedup, so the dataframes are final.
+    for key, df in [
+        ("ivr", ivr_final),
+        ("sms_web_transactional", txn_final),
+        ("sms_web_relational", rel_final),
+        ("api_web_transactional", api_txn_final),
+        ("api_web_relational", api_rel_final),
+    ]:
+        if not availability_flags[key] and df is not None and df.count() > 0:
+            availability_flags[key] = True
+
+#Change 3: after the loop. In the tracker write section, replace the five lines that read ... is not None and ....count() > 0 with:
+ivr_available     = availability_flags["ivr"]
+txn_available     = availability_flags["sms_web_transactional"]
+rel_available     = availability_flags["sms_web_relational"]
+api_txn_available = availability_flags["api_web_transactional"]
+api_rel_available = availability_flags["api_web_relational"]
+
